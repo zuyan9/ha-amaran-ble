@@ -1,0 +1,27 @@
+[project]
+name = "ha-amaran-ble"
+version = "0.2.0"
+description = "Home Assistant custom integration for amaran Bluetooth Mesh lights"
+readme = "README.md"
+requires-python = ">=3.14"
+license = "MIT"
+dependencies = ["cryptography>=45"]
+
+[dependency-groups]
+test = [
+  "pytest>=8",
+  "pytest-asyncio>=0.25",
+]
+lint = ["ruff>=0.12"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["ASYNC", "B", "E", "F", "I", "LOG", "RUF", "SIM", "UP", "W"]
+ignore = ["ASYNC109", "E501"]

@@ -1,0 +1,60 @@
+{
+  "config": {
+    "flow_title": "{name}",
+    "step": {
+      "user": {
+        "title": "Add an amaran light",
+        "description": "Choose a fixture to add. It must be factory reset and not paired with the amaran app.",
+        "data": {
+          "address": "Fixture"
+        }
+      },
+      "confirm": {
+        "title": "Add {name}",
+        "description": "Home Assistant will provision {name} ({address}) into its own private Bluetooth Mesh network.\n\nThis takes the fixture out of any mesh it currently belongs to, so the amaran app will no longer see it until you factory reset the light.",
+        "data": {
+          "supports_color": "Fixture supports full colour (RGB)",
+          "min_kelvin": "Minimum colour temperature",
+          "max_kelvin": "Maximum colour temperature"
+        },
+        "data_description": {
+          "supports_color": "Turn this off for bi-colour fixtures such as the Ace 25x, which only adjust white balance. amaran model names ending in 'c' are full colour; those ending in 'x' are bi-colour.",
+          "min_kelvin": "Use your fixture's rated range; you can change this later.",
+          "max_kelvin": "The protocol allows 800 K to 10000 K regardless of what the fixture can render."
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not connect to the fixture. Move it closer to a Bluetooth adapter or proxy and try again.",
+      "provisioning_failed": "Provisioning failed. Factory reset the fixture and try again.",
+      "invalid_range": "The maximum colour temperature must be higher than the minimum.",
+      "already_provisioned": "This fixture belongs to another Bluetooth Mesh network, most likely the amaran app's. Factory reset the light and try again."
+    },
+    "abort": {
+      "already_configured": "This fixture is already set up.",
+      "no_devices_found": "No amaran fixtures found. Make sure the light is powered on and factory reset.",
+      "not_supported": "This device is not a supported amaran fixture."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Fixture capabilities",
+        "description": "These cannot be read over Bluetooth Mesh, so set them to match your fixture.",
+        "data": {
+          "supports_color": "Fixture supports full colour (RGB)",
+          "min_kelvin": "Minimum colour temperature",
+          "max_kelvin": "Maximum colour temperature"
+        },
+        "data_description": {
+          "supports_color": "Turn this off for bi-colour fixtures such as the Ace 25x, which only adjust white balance.",
+          "min_kelvin": "The warmest-to-coolest range shown in Home Assistant.",
+          "max_kelvin": "The protocol allows 800 K to 10000 K; use your fixture's rated range."
+        }
+      }
+    },
+    "error": {
+      "invalid_range": "The maximum colour temperature must be higher than the minimum."
+    }
+  }
+}
