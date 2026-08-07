@@ -1,126 +1,85 @@
+<p align="center">
+  <img src="custom_components/amaran_ble/brand/logo.png" alt="amaran" width="400">
+</p>
+
 # amaran BLE for Home Assistant
 
-Local Bluetooth control for amaran and Aputure photography lights. The
-integration provisions each fixture into a small Home Assistant-owned
-Bluetooth Mesh network and exposes it as a native `light` entity.
+Local Bluetooth Mesh control for amaran photography lights in Home Assistant.
+No amaran account, cloud service, MQTT, or external bridge is required.
 
-The implementation is unofficial and does not use an amaran account, Sidus
-Link, the cloud, MQTT, or an external bridge.
+## Features
 
-## Supported features
+- Power and brightness control
+- Adjustable colour temperature
+- Hue and saturation control on full-colour fixtures
+- Live state updates and automatic reconnection
+- Setup and capability options through the Home Assistant UI
 
-- Power
-- Brightness (0–100%)
-- Correlated colour temperature
-- HS colour on RGB fixtures
-- Pushed state updates plus periodic refresh
-- Automatic reconnect through Home Assistant Bluetooth adapters and proxies
-- UI-based discovery, setup, and capability options
+The **amaran Ace 25x** is hardware-tested for power, brightness, and its
+2700–6500 K colour-temperature range. Other models may work but have not yet
+been verified, and RGB control has not yet been tested on physical hardware.
+Effects, fan control, and boost mode are not currently exposed.
 
-The amaran Ace 25x is hardware-tested for power, brightness, and its official
-2700–6500 K CCT range. It is bi-colour, so turn off **Fixture supports full
-colour** during setup.
+## Requirements
 
-Effects, fan control, and boost mode are not exposed yet. The Ace advertises
-those capabilities, but their `0x26` payloads have not been captured and
-validated safely.
-
-## Important: fixture ownership
-
-A Bluetooth Mesh fixture can only belong to one mesh network at a time. This
-integration deliberately creates and owns a private network for each light.
-
-Before adding a fixture:
-
-1. Remove it from the amaran/Sidus Link app if present.
-2. Factory-reset its Bluetooth/Mesh settings using the fixture's menu.
-3. Keep it powered on and near a connectable Home Assistant Bluetooth adapter.
-4. In Home Assistant, open **Settings → Devices & services → Add integration**
-   and choose **amaran BLE**.
-
-After Home Assistant provisions the light, the vendor app cannot control it.
-Deleting the Home Assistant config entry makes a best-effort Mesh Node Reset so
-the fixture can be adopted again. If the fixture is off or out of range during
-deletion, factory-reset it manually before pairing elsewhere.
+- Home Assistant 2026.8.0 or newer
+- A connectable Home Assistant Bluetooth adapter or Bluetooth proxy
+- A factory-reset amaran light within Bluetooth range
 
 ## Installation
 
-### HACS custom repository
+### HACS
 
-1. Open HACS and choose **Integrations**.
-2. Add this repository as a custom repository of type **Integration**.
-3. Install **amaran BLE**.
-4. Restart Home Assistant.
+1. Add `https://github.com/zuyan9/ha-amaran-ble` to HACS as a custom
+   **Integration** repository.
+2. Install **amaran BLE**.
+3. Restart Home Assistant.
 
 ### Manual
 
-Copy `custom_components/amaran_ble` into the same directory under your Home
-Assistant configuration folder, then restart Home Assistant:
+Copy `custom_components/amaran_ble` into your Home Assistant
+`custom_components` directory, then restart Home Assistant.
 
-```text
-config/
-└── custom_components/
-    └── amaran_ble/
-        ├── __init__.py
-        ├── config_flow.py
-        ├── light.py
-        └── manifest.json
-```
+## Setup
 
-Home Assistant Core 2026.8.0 is the currently tested release.
+> [!IMPORTANT]
+> Home Assistant provisions the light into its own private Bluetooth Mesh
+> network. Sidus Link cannot control the light afterward unless you remove it
+> from Home Assistant or factory-reset its Bluetooth/Mesh settings.
 
-## Bluetooth discovery
+1. Remove the light from Sidus Link, then factory-reset its Bluetooth/Mesh
+   settings.
+2. Keep the light powered on and close to a connectable Bluetooth adapter.
+3. In Home Assistant, open **Settings → Devices & services → Add integration**.
+4. Select **amaran BLE**, choose the discovered light, and confirm its
+   capabilities.
 
-Factory-reset fixtures advertise the standard Mesh Provisioning service
-`0x1827`. Provisioned fixtures advertise Mesh Proxy service `0x1828`. The
-integration additionally requires amaran's observed Telink manufacturer ID or
-`SLCK` local name so it does not offer unrelated Bluetooth Mesh products.
+Model names ending in `x`, such as the Ace 25x, are generally bi-colour. Model
+names ending in `c` are generally full-colour; enable the full-colour option for
+those fixtures. Set the colour-temperature range to the values specified for
+your model.
 
-If a fixture is not listed:
+Deleting the integration sends a best-effort Mesh reset to release the light.
+If the light is powered off or unreachable during removal, factory-reset it
+manually before pairing it elsewhere.
 
-- confirm it is factory-reset rather than merely powered off;
-- close the amaran/Sidus Link app so it is not holding the BLE connection;
-- use a Home Assistant Bluetooth adapter or proxy that supports active
-  connections;
-- move the light closer for initial provisioning;
-- reload the Bluetooth integration, then try **Add integration** again.
+## Troubleshooting
 
-## How it works
+- **Light not found:** factory-reset Bluetooth/Mesh, close Sidus Link, and move
+  the light closer to the Bluetooth adapter.
+- **Already provisioned:** the light still belongs to another Mesh network;
+  factory-reset it and try again.
+- **Entity unavailable:** confirm the light is powered on and that the adapter
+  or proxy supports active Bluetooth connections.
 
-The integration implements the relevant Bluetooth Mesh layers directly:
+Please report unsupported models or problems through
+[GitHub Issues](https://github.com/zuyan9/ha-amaran-ble/issues).
 
-- PB-GATT no-OOB provisioning over service `0x1827`;
-- NetKey/AppKey/DeviceKey derivation and AES-CMAC/AES-CCM framing;
-- Mesh Proxy SAR, proxy filters, replay-safe sequence numbers, and segmented
-  access messages over service `0x1828`;
-- configuration-model AppKey installation and model binding;
-- amaran's proprietary access opcode `0x26` for physical LED control.
+## Credits
 
-Sequence numbers are reserved in durable blocks before transmission. This is
-important: reusing a number after an abrupt Home Assistant restart causes the
-fixture to reject otherwise valid packets as replays.
+The light-control protocol is based on the reverse engineering in
+[wesbos/amaran-BLE-control](https://github.com/wesbos/amaran-BLE-control). See
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for its retained attribution.
 
-## Development
-
-The deterministic protocol suite can run without a Home Assistant checkout:
-
-```bash
-uv run --no-project --python 3.11 \
-  --with pytest --with pytest-asyncio --with cryptography \
-  pytest -q
-```
-
-The integration itself targets the Python and APIs bundled with Home Assistant
-2026.8.0. Before release, also run Home Assistant's configuration check against
-an installation containing the component.
-
-## Protocol acknowledgements
-
-The proprietary light payload encoder and status decoder are based on the
-reverse engineering in [wesbos/amaran-BLE-control](https://github.com/wesbos/amaran-BLE-control).
-Its MIT attribution is retained in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-The Home Assistant lifecycle and BLE UX were informed by
-[rabits/ha-ef-ble](https://github.com/rabits/ha-ef-ble) and current Home
-Assistant Bluetooth integration guidance.
-
-This project is not affiliated with amaran, Aputure, or Sidus Link.
+This is an unofficial project and is not affiliated with amaran, Aputure, or
+Sidus Link.
