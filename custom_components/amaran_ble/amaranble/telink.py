@@ -340,6 +340,7 @@ class PowerState:
     """Decoded battery and external-power report."""
 
     source: PowerSource
+    power_state_raw: bool
     battery_percent: int
     runtime_minutes: int
     battery_voltage_raw: int
@@ -1010,14 +1011,16 @@ def decode_power(payload: bytes, *, protocol_version: int = 0) -> PowerState | N
     if not _valid_payload(payload, CMD_POWER):
         return None
     runtime_start, runtime_width = (21, 12) if protocol_version >= 42 else (24, 9)
+    external_voltage_raw = _get_bits(payload, 56, 16)
     return PowerState(
-        source=(
-            PowerSource.EXTERNAL if _get_bits(payload, 20, 1) else PowerSource.BATTERY
-        ),
+        # Sidus Link renders "AC Power" whenever this voltage is non-zero.
+        # Bit 20 is a separate power/standby state and must not select the source.
+        source=PowerSource.EXTERNAL if external_voltage_raw else PowerSource.BATTERY,
+        power_state_raw=bool(_get_bits(payload, 20, 1)),
         battery_percent=_get_bits(payload, 33, 7),
         runtime_minutes=_get_bits(payload, runtime_start, runtime_width),
         battery_voltage_raw=_get_bits(payload, 40, 16),
-        external_voltage_raw=_get_bits(payload, 56, 16),
+        external_voltage_raw=external_voltage_raw,
     )
 
 

@@ -69,6 +69,7 @@ def _entry() -> ConfigEntry:
         ),
         power_state=telink.PowerState(
             source=telink.PowerSource.EXTERNAL,
+            power_state_raw=True,
             battery_percent=82,
             runtime_minutes=145,
             battery_voltage_raw=1480,
@@ -235,6 +236,7 @@ async def test_diagnostics_include_deterministic_profile_and_decoded_states() ->
         "smart",
     ]
     assert runtime["states"]["power"]["data"]["source"] == "external"
+    assert runtime["states"]["power"]["data"]["power_state_raw"] is True
     assert runtime["states"]["power"]["data"]["battery_percent"] == 82
     assert runtime["states"]["advanced_capabilities"]["data"][
         "system_effect_groups"
@@ -254,6 +256,7 @@ async def test_diagnostics_preserve_raw_battery_percentage() -> None:
     entry = _entry()
     entry.runtime_data.power_state = telink.PowerState(
         source=telink.PowerSource.EXTERNAL,
+        power_state_raw=False,
         battery_percent=127,
         runtime_minutes=145,
         battery_voltage_raw=1480,
@@ -263,3 +266,4 @@ async def test_diagnostics_preserve_raw_battery_percentage() -> None:
     result = await diagnostics.async_get_config_entry_diagnostics(object(), entry)
 
     assert result["runtime"]["states"]["power"]["data"]["battery_percent"] == 127
+    assert result["runtime"]["states"]["power"]["data"]["power_state_raw"] is False

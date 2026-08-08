@@ -2000,6 +2000,28 @@ async def test_boost_tracks_modal_state_without_a_report(
     light._async_send.assert_any_await(telink.boost(True, 4300, 100))
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_boost_same_modal_state_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    """A redundant modal request must not write or refresh the steady output."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    steady = light_state(is_hsi=False)
+    boost = telink.BoostState(enabled, 4300, 100)
+    light._state = steady
+    light._boost_state = boost
+    light._async_send = AsyncMock()
+    light._async_refresh_state = AsyncMock(return_value=True)
+
+    await light.async_set_boost(enabled)
+
+    light._async_send.assert_not_awaited()
+    light._async_refresh_state.assert_not_awaited()
+    assert light.state is steady
+    assert light.boost_state is boost
+
+
 def test_unsolicited_boost_report_cannot_enable_the_modal_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2072,23 +2094,69 @@ async def test_boost_write_failure_does_not_mutate_cache(
 
 
 @pytest.mark.asyncio
-async def test_fan_same_mode_still_requires_fresh_query_confirmation(
+async def test_fan_same_supported_mode_is_idempotent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A stale cached mode cannot make an unanswered fan write succeed."""
+    """A current report makes re-selecting the supported mode a no-op."""
     light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
     light._fan_state = telink.decode_fan(fan_report(telink.FanMode.SMART))
     light._async_send = AsyncMock()
     light._async_refresh_optional = AsyncMock(return_value=False)
+    sleep = AsyncMock()
+    monkeypatch.setattr(device.asyncio, "sleep", sleep)
+
+    await light.async_set_fan_mode("smart")
+
+    light._async_send.assert_not_awaited()
+    light._async_refresh_optional.assert_not_awaited()
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fan_mode_retries_one_lost_confirmation_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A changed mode succeeds when the second bounded query gets its report."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._fan_state = telink.decode_fan(fan_report(telink.FanMode.SMART))
+    light._async_send = AsyncMock()
+    attempts = 0
+
+    async def refresh(*_args: object) -> bool:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return False
+        light._fan_state = telink.decode_fan(fan_report(telink.FanMode.SILENT))
+        return True
+
+    light._async_refresh_optional = AsyncMock(side_effect=refresh)
+    monkeypatch.setattr(device.asyncio, "sleep", AsyncMock())
+
+    await light.async_set_fan_mode("silent")
+
+    light._async_send.assert_awaited_once_with(telink.fan("silent"))
+    assert light._async_refresh_optional.await_count == 2
+    assert light.fan_state is not None
+    assert light.fan_state.mode is telink.FanMode.SILENT
+
+
+@pytest.mark.asyncio
+async def test_fan_mode_rejects_two_lost_confirmation_reports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A changed mode fails after exactly two unanswered status queries."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._fan_state = telink.decode_fan(fan_report(telink.FanMode.SMART))
+    light._async_send = AsyncMock()
+    light._async_refresh_optional = AsyncMock(side_effect=[False, False])
     monkeypatch.setattr(device.asyncio, "sleep", AsyncMock())
 
     with pytest.raises(device.AmaranConnectionError, match="did not confirm"):
-        await light.async_set_fan_mode("smart")
+        await light.async_set_fan_mode("silent")
 
-    light._async_send.assert_awaited_once_with(telink.fan("smart"))
-    light._async_refresh_optional.assert_awaited_once_with(
-        telink.fan_request(), light._fan_received
-    )
+    light._async_send.assert_awaited_once_with(telink.fan("silent"))
+    assert light._async_refresh_optional.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -2098,14 +2166,25 @@ async def test_manual_fan_mode_preserves_reported_speed(
     """Selecting Manual must not overwrite the known target with zero RPM."""
     light = make_light(monkeypatch, profile=get_fixture_profile_by_product_id("000G5"))
     light._fan_state = telink.FanState(
-        telink.FanMode.MANUAL,
+        telink.FanMode.SMART,
         fixture_speed=650,
         current_temperature_raw=0,
         high_temperature_raw=0,
-        supported_modes=(telink.FanMode.MANUAL,),
+        supported_modes=(telink.FanMode.MANUAL, telink.FanMode.SMART),
     )
     light._async_send = AsyncMock()
-    light._async_refresh_optional = AsyncMock(return_value=True)
+
+    async def refresh(*_args: object) -> bool:
+        light._fan_state = telink.FanState(
+            telink.FanMode.MANUAL,
+            fixture_speed=650,
+            current_temperature_raw=0,
+            high_temperature_raw=0,
+            supported_modes=(telink.FanMode.MANUAL, telink.FanMode.SMART),
+        )
+        return True
+
+    light._async_refresh_optional = AsyncMock(side_effect=refresh)
     monkeypatch.setattr(device.asyncio, "sleep", AsyncMock())
 
     await light.async_set_fan_mode("manual")
@@ -2160,6 +2239,69 @@ async def test_manual_fan_speed_requires_mode_and_fresh_confirmation(
 
 
 @pytest.mark.asyncio
+async def test_manual_fan_speed_retries_one_lost_confirmation_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A manual target succeeds when the retry receives the exact RPM."""
+    light = make_light(monkeypatch, profile=get_fixture_profile_by_product_id("000G5"))
+    light._fan_state = telink.FanState(
+        telink.FanMode.MANUAL,
+        fixture_speed=650,
+        current_temperature_raw=0,
+        high_temperature_raw=0,
+        supported_modes=(telink.FanMode.MANUAL,),
+    )
+    light._async_send = AsyncMock()
+    attempts = 0
+
+    async def refresh(*_args: object) -> bool:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return False
+        light._fan_state = telink.FanState(
+            telink.FanMode.MANUAL,
+            fixture_speed=700,
+            current_temperature_raw=0,
+            high_temperature_raw=0,
+            supported_modes=(telink.FanMode.MANUAL,),
+        )
+        return True
+
+    light._async_refresh_optional = AsyncMock(side_effect=refresh)
+    monkeypatch.setattr(device.asyncio, "sleep", AsyncMock())
+
+    await light.async_set_fan_speed(700)
+
+    light._async_send.assert_awaited_once_with(telink.fan(telink.FanMode.MANUAL, 700))
+    assert light._async_refresh_optional.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_manual_fan_speed_rejects_two_lost_confirmation_reports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A manual target fails after exactly two unanswered status queries."""
+    light = make_light(monkeypatch, profile=get_fixture_profile_by_product_id("000G5"))
+    light._fan_state = telink.FanState(
+        telink.FanMode.MANUAL,
+        fixture_speed=650,
+        current_temperature_raw=0,
+        high_temperature_raw=0,
+        supported_modes=(telink.FanMode.MANUAL,),
+    )
+    light._async_send = AsyncMock()
+    light._async_refresh_optional = AsyncMock(side_effect=[False, False])
+    monkeypatch.setattr(device.asyncio, "sleep", AsyncMock())
+
+    with pytest.raises(device.AmaranConnectionError, match="did not confirm"):
+        await light.async_set_fan_speed(700)
+
+    light._async_send.assert_awaited_once_with(telink.fan(telink.FanMode.MANUAL, 700))
+    assert light._async_refresh_optional.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_manual_fan_speed_rejects_stale_or_wrong_report(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2178,6 +2320,8 @@ async def test_manual_fan_speed_rejects_stale_or_wrong_report(
 
     with pytest.raises(device.AmaranConnectionError, match="did not confirm"):
         await light.async_set_fan_speed(700)
+
+    assert light._async_refresh_optional.await_count == 2
 
 
 def test_write_form_pages_cannot_confirm_their_own_commands(

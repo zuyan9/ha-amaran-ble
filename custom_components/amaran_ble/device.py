@@ -1533,6 +1533,8 @@ class AmaranLight:
         if not self.profile.supports_boost:
             raise AmaranConnectionError(f"Boost is not enabled for {self.name}")
         async with self._operation_lock:
+            if self._boost_state is not None and self._boost_state.enabled is enabled:
+                return
             await self._async_set_boost_unlocked(enabled)
             await self._async_refresh_state()
 
@@ -1613,6 +1615,12 @@ class AmaranLight:
             raise AmaranConnectionError(f"{mode} is not supported by {self.name}")
         selected = telink.FanMode(mode)
         async with self._operation_lock:
+            if (
+                self._fan_state is not None
+                and self._fan_state.mode is selected
+                and selected in self._fan_state.supported_modes
+            ):
+                return
             needs_capability_report = (
                 self._fan_state is None
                 or selected not in self._fan_state.supported_modes
@@ -1643,18 +1651,18 @@ class AmaranLight:
             # echo lacks capability and temperature fields and is not enough
             # to confirm that the fixture applied the requested mode.
             await asyncio.sleep(FAN_APPLY_SETTLE)
-            confirmed = await self._async_refresh_optional(
-                telink.fan_request(), self._fan_received
-            )
-            if (
-                not confirmed
-                or self._fan_state is None
-                or self._fan_state.mode is not selected
-                or selected not in self._fan_state.supported_modes
-            ):
-                raise AmaranConnectionError(
-                    f"{self.name} did not confirm fan mode {mode}"
+            for _ in range(2):
+                confirmed = await self._async_refresh_optional(
+                    telink.fan_request(), self._fan_received
                 )
+                if (
+                    confirmed
+                    and self._fan_state is not None
+                    and self._fan_state.mode is selected
+                    and selected in self._fan_state.supported_modes
+                ):
+                    return
+            raise AmaranConnectionError(f"{self.name} did not confirm fan mode {mode}")
 
     async def async_set_fan_speed(self, speed_rpm: float) -> None:
         """Set and confirm the target speed while Manual fan mode is active."""
@@ -1683,19 +1691,21 @@ class AmaranLight:
             self._fan_received.clear()
             await self._async_send(telink.fan(telink.FanMode.MANUAL, target))
             await asyncio.sleep(FAN_APPLY_SETTLE)
-            confirmed = await self._async_refresh_optional(
-                telink.fan_request(), self._fan_received
-            )
-            if (
-                not confirmed
-                or self._fan_state is None
-                or self._fan_state.mode is not telink.FanMode.MANUAL
-                or self._fan_state.fixture_speed != target
-                or telink.FanMode.MANUAL not in self._fan_state.supported_modes
-            ):
-                raise AmaranConnectionError(
-                    f"{self.name} did not confirm manual fan speed {target} RPM"
+            for _ in range(2):
+                confirmed = await self._async_refresh_optional(
+                    telink.fan_request(), self._fan_received
                 )
+                if (
+                    confirmed
+                    and self._fan_state is not None
+                    and self._fan_state.mode is telink.FanMode.MANUAL
+                    and self._fan_state.fixture_speed == target
+                    and telink.FanMode.MANUAL in self._fan_state.supported_modes
+                ):
+                    return
+            raise AmaranConnectionError(
+                f"{self.name} did not confirm manual fan speed {target} RPM"
+            )
 
     async def async_apply_turn_on(
         self,
