@@ -40,6 +40,7 @@ from .const import (
     CONF_LOCAL_ADDRESS,
     CONF_MAX_KELVIN,
     CONF_MIN_KELVIN,
+    CONF_MODEL,
     CONF_NEEDS_CONFIGURATION,
     CONF_NET_KEY,
     CONF_NUM_ELEMENTS,
@@ -50,11 +51,14 @@ from .const import (
     CONF_UNICAST_ADDRESS,
     DEFAULT_MAX_KELVIN,
     DEFAULT_MIN_KELVIN,
+    DEFAULT_PROFILE,
     DEFAULT_SUPPORTS_CCT,
     DEFAULT_SUPPORTS_COLOR,
     DEFAULT_SUPPORTS_GM,
     DOMAIN,
     NODE_ADDRESS,
+    PROFILE_ACE_25X,
+    PROFILE_GENERIC,
     PROVISIONER_ADDRESS,
     TELINK_ADDRESS_PREFIX,
 )
@@ -63,6 +67,7 @@ from .pending import (
     async_get_pending,
     async_save_pending,
 )
+from .profiles import PROFILES, get_fixture_profile
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -102,6 +107,68 @@ def _kelvin_selector() -> selector.NumberSelector:
             min=MIN_KELVIN, max=MAX_KELVIN, step=100, unit_of_measurement="K"
         )
     )
+
+
+def _model_selector() -> selector.SelectSelector:
+    """Offer only profiles whose model-specific commands are verified."""
+    return selector.SelectSelector(
+        selector.SelectSelectorConfig(
+            options=[
+                selector.SelectOptionDict(
+                    value=PROFILE_GENERIC, label="Generic amaran light"
+                ),
+                selector.SelectOptionDict(
+                    value=PROFILE_ACE_25X, label="amaran Ace 25x"
+                ),
+            ],
+            mode=selector.SelectSelectorMode.DROPDOWN,
+        )
+    )
+
+
+def options_for_profile(values: dict[str, Any]) -> dict[str, Any]:
+    """Normalize form values into a safe, complete capability selection."""
+    requested_model = str(values.get(CONF_MODEL, DEFAULT_PROFILE))
+    model = requested_model if requested_model in PROFILES else DEFAULT_PROFILE
+    profile = get_fixture_profile(model)
+    if model != PROFILE_GENERIC:
+        return {
+            CONF_MODEL: model,
+            CONF_SUPPORTS_CCT: profile.supports_cct,
+            CONF_SUPPORTS_COLOR: profile.supports_color,
+            CONF_SUPPORTS_GM: profile.supports_gm,
+            CONF_MIN_KELVIN: profile.min_kelvin,
+            CONF_MAX_KELVIN: profile.max_kelvin,
+        }
+
+    supports_cct = bool(values.get(CONF_SUPPORTS_CCT, DEFAULT_SUPPORTS_CCT))
+    return {
+        CONF_MODEL: model,
+        CONF_SUPPORTS_CCT: supports_cct,
+        CONF_SUPPORTS_COLOR: bool(
+            values.get(CONF_SUPPORTS_COLOR, DEFAULT_SUPPORTS_COLOR)
+        ),
+        CONF_SUPPORTS_GM: supports_cct
+        and bool(values.get(CONF_SUPPORTS_GM, DEFAULT_SUPPORTS_GM)),
+        CONF_MIN_KELVIN: int(values.get(CONF_MIN_KELVIN, DEFAULT_MIN_KELVIN)),
+        CONF_MAX_KELVIN: int(values.get(CONF_MAX_KELVIN, DEFAULT_MAX_KELVIN)),
+    }
+
+
+def capability_errors(values: dict[str, Any]) -> dict[str, str]:
+    """Validate the editable capability fields of the generic profile."""
+    if values.get(CONF_MODEL, DEFAULT_PROFILE) != PROFILE_GENERIC:
+        return {}
+    supports_cct = bool(values.get(CONF_SUPPORTS_CCT, DEFAULT_SUPPORTS_CCT))
+    if values.get(CONF_SUPPORTS_GM, DEFAULT_SUPPORTS_GM) and not supports_cct:
+        return {CONF_SUPPORTS_GM: "gm_requires_cct"}
+    if values.get(CONF_SUPPORTS_COLOR, DEFAULT_SUPPORTS_COLOR) and not supports_cct:
+        return {CONF_SUPPORTS_COLOR: "color_requires_cct"}
+    if supports_cct and values.get(CONF_MIN_KELVIN, DEFAULT_MIN_KELVIN) >= values.get(
+        CONF_MAX_KELVIN, DEFAULT_MAX_KELVIN
+    ):
+        return {CONF_MAX_KELVIN: "invalid_range"}
+    return {}
 
 
 def suggested_title(info: BluetoothServiceInfoBleak) -> str:
@@ -185,19 +252,8 @@ class AmaranConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is None:
             return self._confirm_form(info, {}, {})
 
-        supports_cct = bool(user_input[CONF_SUPPORTS_CCT])
-        if user_input[CONF_SUPPORTS_GM] and not supports_cct:
-            return self._confirm_form(
-                info, {CONF_SUPPORTS_GM: "gm_requires_cct"}, user_input
-            )
-        if user_input[CONF_SUPPORTS_COLOR] and not supports_cct:
-            return self._confirm_form(
-                info, {CONF_SUPPORTS_COLOR: "color_requires_cct"}, user_input
-            )
-        if supports_cct and user_input[CONF_MIN_KELVIN] >= user_input[CONF_MAX_KELVIN]:
-            return self._confirm_form(
-                info, {CONF_MAX_KELVIN: "invalid_range"}, user_input
-            )
+        if errors := capability_errors(user_input):
+            return self._confirm_form(info, errors, user_input)
 
         try:
             data = await self._async_provision(info)
@@ -220,13 +276,7 @@ class AmaranConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_create_entry(
             title=suggested_title(info),
             data=data,
-            options={
-                CONF_SUPPORTS_CCT: supports_cct,
-                CONF_SUPPORTS_COLOR: user_input[CONF_SUPPORTS_COLOR],
-                CONF_SUPPORTS_GM: supports_cct and bool(user_input[CONF_SUPPORTS_GM]),
-                CONF_MIN_KELVIN: int(user_input[CONF_MIN_KELVIN]),
-                CONF_MAX_KELVIN: int(user_input[CONF_MAX_KELVIN]),
-            },
+            options=options_for_profile(user_input),
         )
 
     def _failure_reason(self, info: BluetoothServiceInfoBleak) -> str:
@@ -266,6 +316,10 @@ class AmaranConfigFlow(ConfigFlow, domain=DOMAIN):
             },
             data_schema=vol.Schema(
                 {
+                    vol.Required(
+                        CONF_MODEL,
+                        default=values.get(CONF_MODEL, DEFAULT_PROFILE),
+                    ): _model_selector(),
                     vol.Required(
                         CONF_SUPPORTS_CCT,
                         default=values.get(CONF_SUPPORTS_CCT, DEFAULT_SUPPORTS_CCT),
@@ -398,30 +452,9 @@ class AmaranOptionsFlow(OptionsFlow):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         if user_input is not None:
-            supports_cct = bool(user_input[CONF_SUPPORTS_CCT])
-            if user_input[CONF_SUPPORTS_GM] and not supports_cct:
-                return self._show_form(
-                    user_input, {CONF_SUPPORTS_GM: "gm_requires_cct"}
-                )
-            if user_input[CONF_SUPPORTS_COLOR] and not supports_cct:
-                return self._show_form(
-                    user_input, {CONF_SUPPORTS_COLOR: "color_requires_cct"}
-                )
-            if (
-                supports_cct
-                and user_input[CONF_MIN_KELVIN] >= user_input[CONF_MAX_KELVIN]
-            ):
-                return self._show_form(user_input, {CONF_MAX_KELVIN: "invalid_range"})
-            return self.async_create_entry(
-                data={
-                    CONF_SUPPORTS_CCT: supports_cct,
-                    CONF_SUPPORTS_COLOR: bool(user_input[CONF_SUPPORTS_COLOR]),
-                    CONF_SUPPORTS_GM: supports_cct
-                    and bool(user_input[CONF_SUPPORTS_GM]),
-                    CONF_MIN_KELVIN: int(user_input[CONF_MIN_KELVIN]),
-                    CONF_MAX_KELVIN: int(user_input[CONF_MAX_KELVIN]),
-                }
-            )
+            if errors := capability_errors(user_input):
+                return self._show_form(user_input, errors)
+            return self.async_create_entry(data=options_for_profile(user_input))
         return self._show_form(dict(self.config_entry.options), {})
 
     def _show_form(
@@ -432,6 +465,10 @@ class AmaranOptionsFlow(OptionsFlow):
             errors=errors,
             data_schema=vol.Schema(
                 {
+                    vol.Required(
+                        CONF_MODEL,
+                        default=values.get(CONF_MODEL, DEFAULT_PROFILE),
+                    ): _model_selector(),
                     vol.Required(
                         CONF_SUPPORTS_CCT,
                         default=values.get(CONF_SUPPORTS_CCT, DEFAULT_SUPPORTS_CCT),

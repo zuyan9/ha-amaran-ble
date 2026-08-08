@@ -8,9 +8,11 @@ from typing import Any
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
     ATTR_COLOR_TEMP_KELVIN,
+    ATTR_EFFECT,
     ATTR_HS_COLOR,
     ColorMode,
     LightEntity,
+    LightEntityFeature,
 )
 from homeassistant.const import CONF_ADDRESS
 from homeassistant.core import HomeAssistant, callback
@@ -30,8 +32,10 @@ from .const import (
     DEFAULT_SUPPORTS_COLOR,
     DOMAIN,
     MANUFACTURER,
+    PROFILE_GENERIC,
 )
 from .device import AmaranConnectionError, AmaranLight
+from .profiles import EFFECT_OFF
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -75,14 +79,26 @@ class AmaranLightEntity(LightEntity):
             identifiers={(DOMAIN, address)},
             connections={(CONNECTION_BLUETOOTH, address)},
             manufacturer=MANUFACTURER,
+            model=self._device.profile.name,
             name=entry.title,
         )
 
         options = entry.options
-        self._supports_cct = bool(options.get(CONF_SUPPORTS_CCT, DEFAULT_SUPPORTS_CCT))
-        supports_color = options.get(CONF_SUPPORTS_COLOR, DEFAULT_SUPPORTS_COLOR)
-        self._min_kelvin = int(options.get(CONF_MIN_KELVIN, DEFAULT_MIN_KELVIN))
-        self._max_kelvin = int(options.get(CONF_MAX_KELVIN, DEFAULT_MAX_KELVIN))
+        profile = self._device.profile
+        if profile.key == PROFILE_GENERIC:
+            self._supports_cct = bool(
+                options.get(CONF_SUPPORTS_CCT, DEFAULT_SUPPORTS_CCT)
+            )
+            supports_color = bool(
+                options.get(CONF_SUPPORTS_COLOR, DEFAULT_SUPPORTS_COLOR)
+            )
+            self._min_kelvin = int(options.get(CONF_MIN_KELVIN, DEFAULT_MIN_KELVIN))
+            self._max_kelvin = int(options.get(CONF_MAX_KELVIN, DEFAULT_MAX_KELVIN))
+        else:
+            self._supports_cct = profile.supports_cct
+            supports_color = profile.supports_color
+            self._min_kelvin = profile.min_kelvin
+            self._max_kelvin = profile.max_kelvin
 
         supported_color_modes: set[ColorMode] = set()
         if self._supports_cct:
@@ -92,6 +108,9 @@ class AmaranLightEntity(LightEntity):
         if not supported_color_modes:
             supported_color_modes.add(ColorMode.BRIGHTNESS)
         self._attr_supported_color_modes = supported_color_modes
+        if profile.supports_effects:
+            self._attr_supported_features = LightEntityFeature.EFFECT
+            self._attr_effect_list = list(profile.effects)
 
         if self._supports_cct:
             self._attr_min_color_temp_kelvin = self._min_kelvin
@@ -110,16 +129,31 @@ class AmaranLightEntity(LightEntity):
 
     @property
     def is_on(self) -> bool | None:
+        effect = self._device.effect_state
+        if effect is not None:
+            return effect.on
         state = self._device.state
         return None if state is None else state.on
 
     @property
     def brightness(self) -> int | None:
+        effect = self._device.effect_state
+        if effect is not None:
+            return _to_brightness(effect.intensity)
         state = self._device.state
         return None if state is None else _to_brightness(state.intensity)
 
     @property
+    def effect(self) -> str | None:
+        if not self._device.profile.supports_effects:
+            return None
+        state = self._device.effect_state
+        return EFFECT_OFF if state is None else state.effect.value
+
+    @property
     def color_mode(self) -> ColorMode | None:
+        if self._device.effect_state is not None:
+            return ColorMode.BRIGHTNESS
         state = self._device.state
         if state is None:
             return None
@@ -135,6 +169,8 @@ class AmaranLightEntity(LightEntity):
 
     @property
     def color_temp_kelvin(self) -> int | None:
+        if self._device.effect_state is not None:
+            return None
         state = self._device.state
         if state is None or state.is_hsi or not self._supports_cct:
             return None
@@ -142,6 +178,8 @@ class AmaranLightEntity(LightEntity):
 
     @property
     def hs_color(self) -> tuple[float, float] | None:
+        if self._device.effect_state is not None:
+            return None
         state = self._device.state
         if (
             state is None
@@ -153,7 +191,9 @@ class AmaranLightEntity(LightEntity):
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         state = self._device.state
+        effect_state = self._device.effect_state
         brightness = kwargs.get(ATTR_BRIGHTNESS)
+        requested_effect = kwargs.get(ATTR_EFFECT)
         color_temp = kwargs.get(ATTR_COLOR_TEMP_KELVIN)
         hs_color = (
             kwargs.get(ATTR_HS_COLOR)
@@ -165,12 +205,20 @@ class AmaranLightEntity(LightEntity):
 
         if brightness is not None:
             intensity = _to_intensity(brightness)
+        elif effect_state is not None and effect_state.intensity > 0:
+            intensity = effect_state.intensity
         elif state is not None and state.intensity > 0:
             intensity = state.intensity
         else:
             intensity = MAX_INTENSITY
 
         try:
+            if requested_effect is not None:
+                await self._device.async_apply_effect(
+                    requested_effect,
+                    intensity=intensity if brightness is not None else None,
+                )
+                return
             if color_temp is not None:
                 color_temp = min(
                     max(color_temp, self._min_kelvin),

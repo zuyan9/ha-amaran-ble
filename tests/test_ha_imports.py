@@ -18,6 +18,10 @@ pytest.importorskip("homeassistant")
         "custom_components.amaran_ble.light",
         "custom_components.amaran_ble.number",
         "custom_components.amaran_ble.pending",
+        "custom_components.amaran_ble.profiles",
+        "custom_components.amaran_ble.select",
+        "custom_components.amaran_ble.sensor",
+        "custom_components.amaran_ble.switch",
     ],
 )
 def test_home_assistant_module_imports(module: str) -> None:

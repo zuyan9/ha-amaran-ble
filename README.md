@@ -21,20 +21,34 @@ No amaran account, vendor cloud service, MQTT, or vendor bridge is required.
 
 ## Features
 
-- Power and brightness control, including fixed-daylight fixtures
-- Configurable fixture-specific CCT range (the protocol carries 800–20000 K)
-- Optional green/magenta tint control
-- Hue and saturation control on full-colour fixtures
-- Live state updates and automatic reconnection
-- Setup and capability options through the Home Assistant UI
+- Fully local power, brightness, CCT, HSI colour, and optional green/magenta
+  control
+- Live state updates, automatic reconnection, and crash-safe Bluetooth Mesh
+  sequence handling
+- A dedicated **Ace 25x** profile with:
+  - All nine built-in effects, effect intensity, rate/Random, CCT, and colour
+    presets
+  - Boost mode and its 3800–5500 K colour-temperature control
+  - Report-confirmed fan modes, fan speed, and internal temperature
+  - Battery level, estimated runtime, power source, and firmware diagnostics
+- Setup and model/capability options through the Home Assistant UI
+
+Some effects flash rapidly. Use Strobe, Lightning, Explosion, Paparazzi, and
+Fireworks with appropriate photosensitivity precautions.
 
 ## Compatibility
 
-The integration uses the same Telink light-control protocol reverse engineered
-by [wesbos/amaran-BLE-control](https://github.com/wesbos/amaran-BLE-control),
-without a hard-coded model allowlist. During setup, choose whether the fixture
-supports CCT, HSI colour, and green/magenta adjustment; fixed-daylight models
-can use a brightness-only profile.
+The **Ace 25x** is the hardware-tested model. Select its named profile to enable
+the model-specific controls above.
+
+Other single-zone Telink-based amaran/Aputure fixtures may work using the
+**Generic** profile. Their power, brightness, CCT, HSI, and G/M capabilities are
+configured manually and remain experimental. Multi-zone/pixel effects, groups,
+scenes, app shortcuts, USB output, physical-button settings, factory reset,
+and firmware updates are not currently exposed.
+
+The light-control foundation builds on the protocol reverse engineered by
+[wesbos/amaran-BLE-control](https://github.com/wesbos/amaran-BLE-control).
 
 ## Requirements
 
@@ -48,8 +62,11 @@ can use a brightness-only profile.
    settings.
 2. Keep the light powered on and close to a connectable Bluetooth adapter.
 3. In Home Assistant, open **Settings → Devices & services → Add integration**.
-4. Select **amaran BLE**, choose the discovered light, and confirm its
-   capabilities.
+4. Select **amaran BLE**, choose the discovered light, and select its model.
+
+For an existing installation, open **Settings → Devices & services → amaran
+BLE → Configure**, select **amaran Ace 25x**, and save to add its extended
+entities.
 
 ## Troubleshooting
 

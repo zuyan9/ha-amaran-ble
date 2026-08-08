@@ -44,10 +44,17 @@ from .device import (
     async_release_node,
 )
 from .pending import async_remove_pending
+from .profiles import profile_for_entry
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = [Platform.LIGHT, Platform.NUMBER]
+PLATFORMS: list[Platform] = [
+    Platform.LIGHT,
+    Platform.NUMBER,
+    Platform.SELECT,
+    Platform.SENSOR,
+    Platform.SWITCH,
+]
 
 # Resetting the node on removal is best effort; never let it stall the UI.
 RELEASE_TIMEOUT = 30.0
@@ -61,8 +68,8 @@ async def async_migrate_entry(hass: HomeAssistant, entry: AmaranConfigEntry) -> 
         return False
 
     # A pre-release 0.3 build briefly used minor version 3 for additive option
-    # keys. The old integration already ignores unknown options, so normalize
-    # it back to 2 and retain safe HACS rollback compatibility.
+    # keys. Unknown options are safely ignored by 0.3.1, so normalize it back
+    # to 2 and retain HACS rollback compatibility.
     if entry.version == 1 and entry.minor_version == 3:
         hass.config_entries.async_update_entry(entry, minor_version=2)
         return True
@@ -147,6 +154,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: AmaranConfigEntry) -> bo
         local_address=data.get(CONF_LOCAL_ADDRESS, PROVISIONER_ADDRESS),
         iv_index=data.get(CONF_IV_INDEX, 0),
         initial_sequence=data.get(CONF_INITIAL_SEQUENCE, 0),
+        profile=profile_for_entry(entry),
     )
 
     try:

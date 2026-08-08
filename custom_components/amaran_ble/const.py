@@ -18,12 +18,12 @@ CONF_UNICAST_ADDRESS: Final = "unicast_address"
 CONF_LOCAL_ADDRESS: Final = "local_address"
 CONF_IV_INDEX: Final = "iv_index"
 CONF_NUM_ELEMENTS: Final = "num_elements"
-CONF_MODEL: Final = "model"
 CONF_INITIAL_SEQUENCE: Final = "initial_sequence"
 CONF_SEQUENCE_STORE_ID: Final = "sequence_store_id"
 CONF_NEEDS_CONFIGURATION: Final = "needs_configuration"
 
 # Config entry options.
+CONF_MODEL: Final = "model"
 CONF_SUPPORTS_CCT: Final = "supports_cct"
 CONF_SUPPORTS_COLOR: Final = "supports_color"
 CONF_SUPPORTS_GM: Final = "supports_gm"
@@ -36,6 +36,10 @@ DEFAULT_SUPPORTS_COLOR: Final = False
 DEFAULT_SUPPORTS_GM: Final = False
 DEFAULT_MIN_KELVIN: Final = 2700
 DEFAULT_MAX_KELVIN: Final = 6500
+
+PROFILE_GENERIC: Final = "generic"
+PROFILE_ACE_25X: Final = "ace_25x"
+DEFAULT_PROFILE: Final = PROFILE_GENERIC
 
 # The provisioner always occupies 0x0001 and the fixture 0x0002: each config
 # entry owns a private single-node mesh, so the addresses never collide.

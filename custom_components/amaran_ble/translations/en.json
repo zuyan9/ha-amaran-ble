@@ -13,6 +13,7 @@
         "title": "Add {name}",
         "description": "Home Assistant will provision {name} ({address}) into its own private Bluetooth Mesh network.\n\nThe fixture must already be factory reset. After setup, the amaran app will not see it until you factory reset it again. Verify that the address belongs to the intended amaran fixture before continuing.",
         "data": {
+          "model": "Fixture model",
           "supports_cct": "Fixture has adjustable colour temperature",
           "supports_color": "Fixture supports full colour (HSI)",
           "supports_gm": "Fixture supports green/magenta adjustment",
@@ -20,6 +21,7 @@
           "max_kelvin": "Maximum colour temperature"
         },
         "data_description": {
+          "model": "Choose Ace 25x to enable its verified effects, Boost, fan, battery, and version controls. Use Generic for other fixtures.",
           "supports_cct": "Turn this off for fixed-daylight fixtures. Models ending in 'x' normally support this; models ending in 'd' normally do not.",
           "supports_color": "Enable this for full-colour fixtures such as models ending in 'c'.",
           "supports_gm": "Adds a separate G/M slider. Enable it only when the fixture supports tint adjustment in CCT mode.",
@@ -48,6 +50,7 @@
         "title": "Fixture capabilities",
         "description": "These cannot be read over Bluetooth Mesh, so set them to match your fixture.",
         "data": {
+          "model": "Fixture model",
           "supports_cct": "Fixture has adjustable colour temperature",
           "supports_color": "Fixture supports full colour (HSI)",
           "supports_gm": "Fixture supports green/magenta adjustment",
@@ -55,6 +58,7 @@
           "max_kelvin": "Maximum colour temperature"
         },
         "data_description": {
+          "model": "Ace 25x uses its verified fixed capabilities. Generic uses the capability fields below.",
           "supports_cct": "Turn this off for fixed-daylight fixtures.",
           "supports_color": "Enable this for full-colour fixtures with HSI control.",
           "supports_gm": "Adds a separate G/M slider and requires adjustable colour temperature.",
@@ -71,8 +75,67 @@
   },
   "entity": {
     "number": {
+      "boost_color_temperature": {
+        "name": "Boost color temperature"
+      },
+      "effect_color_temperature": {
+        "name": "Effect color temperature"
+      },
       "green_magenta": {
         "name": "Green/magenta"
+      }
+    },
+    "select": {
+      "effect_color": {
+        "name": "Effect color",
+        "state": {
+          "cooler": "Cooler",
+          "multi": "Multi",
+          "natural": "Natural",
+          "warmer": "Warmer"
+        }
+      },
+      "effect_rate": {
+        "name": "Effect rate",
+        "state": {
+          "random": "Random"
+        }
+      },
+      "fan_mode": {
+        "name": "Fan mode",
+        "state": {
+          "silent": "Silent",
+          "smart": "Smart"
+        }
+      }
+    },
+    "sensor": {
+      "battery": {
+        "name": "Battery"
+      },
+      "fan_speed": {
+        "name": "Fan speed"
+      },
+      "fan_temperature": {
+        "name": "Fan temperature"
+      },
+      "power_source": {
+        "name": "Power source",
+        "state": {
+          "battery": "Battery",
+          "external": "External power"
+        }
+      },
+      "protocol_version": {
+        "name": "Protocol version"
+      },
+      "remaining_runtime": {
+        "name": "Remaining runtime"
+      }
+    },
+    "switch": {
+      "boost": {
+        "name": "Boost"
       }
     }
   }
