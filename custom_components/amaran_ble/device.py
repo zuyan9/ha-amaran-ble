@@ -34,6 +34,7 @@ from .amaranble.gatt import (
 )
 from .amaranble.proxy import AccessMessage, ProxyClient, ProxyError
 from .amaranble.sequence import SequenceExhaustedError, SequenceReservation
+from .brightness import intensities_have_same_brightness
 from .const import (
     DOMAIN,
     INITIAL_POLL_INTERVAL,
@@ -63,6 +64,30 @@ LEGACY_DUAL_COLOR_EFFECTS = frozenset(
         telink.SystemEffect.WELDING,
     }
 )
+
+
+def _effect_state_matches(
+    report: telink.EffectState | None,
+    expected: telink.EffectState,
+) -> bool:
+    """Compare a command-7 state with HA-equivalent global intensity."""
+    return (
+        report is not None
+        and intensities_have_same_brightness(report.intensity, expected.intensity)
+        and replace(report, intensity=expected.intensity) == expected
+    )
+
+
+def _effect2_state_matches(
+    report: systemfx2.SystemEffect2State | None,
+    expected: systemfx2.SystemEffect2State,
+) -> bool:
+    """Compare a command-34 state with HA-equivalent global intensity."""
+    return (
+        report is not None
+        and intensities_have_same_brightness(report.intensity, expected.intensity)
+        and replace(report, intensity=expected.intensity) == expected
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -956,7 +981,7 @@ class AmaranLight:
         for payload in payloads:
             await self._async_send(payload)
         if not await self._async_confirm_primary_state(
-            lambda: self._effect2_state == expected
+            lambda: _effect2_state_matches(self._effect2_state, expected)
         ):
             raise AmaranConnectionError(
                 f"{self.name} did not confirm its effect {error_label}"
@@ -1106,7 +1131,7 @@ class AmaranLight:
                 if preserving_active_effect:
                     # Brightness changes on the currently selected effect must
                     # preserve every reported field we sent back to the light.
-                    return report == expected_effect
+                    return _effect_state_matches(report, expected_effect)
                 # Firmware chooses and normalizes opaque defaults (notably
                 # speed/trigger) when a different effect is selected. Confirm
                 # the user-visible transition without pretending those defaults
@@ -1115,7 +1140,9 @@ class AmaranLight:
                     report is not None
                     and report.on
                     and report.effect is selected
-                    and report.intensity == expected_intensity
+                    and intensities_have_same_brightness(
+                        report.intensity, expected_intensity
+                    )
                 )
 
             if not await self._async_confirm_primary_state(effect_matches):
@@ -1174,18 +1201,32 @@ class AmaranLight:
         if not output_was_on:
             await self.async_turn_on()
 
-        if not await self._async_confirm_primary_state(
-            lambda: (
-                self._pixel_state is not None
-                and self._pixel_state.on
-                and self._pixel_state.effect is selected
-                and self._pixel_page_generations.get((2, 0), 0) > report_generation
-                and (
-                    selected is not pixelfx.PixelEffect.RAINBOW
-                    or self._pixel_state.intensity == expected_intensity
+        def pixel_effect_matches() -> bool:
+            report = self._pixel_state
+            if (
+                report is None
+                or not report.on
+                or report.effect is not selected
+                or self._pixel_page_generations.get((2, 0), 0) <= report_generation
+            ):
+                return False
+            if selected is pixelfx.PixelEffect.RAINBOW:
+                return intensities_have_same_brightness(
+                    report.intensity, expected_intensity
                 )
+            # Most status replies include only the control page, which carries
+            # no brightness. Preserve that proven fallback, but when the
+            # fixture also returns a fresh brightness-bearing colour/base page,
+            # it must project to the brightness requested by Home Assistant.
+            return all(
+                intensities_have_same_brightness(page.brightness, expected_intensity)
+                for page in report.pages
+                if page.brightness is not None
+                and self._pixel_page_generations.get(_pixel_page_key(page), 0)
+                > report_generation
             )
-        ):
+
+        if not await self._async_confirm_primary_state(pixel_effect_matches):
             raise AmaranConnectionError(
                 f"{self.name} did not confirm pixel effect {selected.value}"
             )
@@ -1279,12 +1320,14 @@ class AmaranLight:
         def effect_matches() -> bool:
             report = self._effect2_state
             if preserving_active_effect:
-                return report == expected
+                return _effect2_state_matches(report, expected)
             return (
                 report is not None
                 and report.on
                 and report.effect is selected
-                and report.intensity == expected_intensity
+                and intensities_have_same_brightness(
+                    report.intensity, expected_intensity
+                )
             )
 
         if not await self._async_confirm_primary_state(effect_matches):
@@ -1307,10 +1350,12 @@ class AmaranLight:
                     steady.kelvin, target_intensity, self._preferred_gm
                 )
         elif current is not None:
-            target_intensity = intensity if intensity is not None else current.intensity
+            target_intensity = (
+                intensity if intensity is not None else current.intensity
+            ) or 180
             await self.async_set_cct(
                 self._default_effect_kelvin(),
-                target_intensity or 180,
+                target_intensity,
                 self._preferred_gm,
             )
         else:
@@ -1329,7 +1374,12 @@ class AmaranLight:
                 and self._pixel_state is None
                 and self._state is not None
                 and self._state.on
-                and (intensity is None or self._state.intensity == intensity)
+                and (
+                    target_intensity is None
+                    or intensities_have_same_brightness(
+                        self._state.intensity, target_intensity
+                    )
+                )
             )
         ):
             raise AmaranConnectionError(
@@ -1374,7 +1424,7 @@ class AmaranLight:
             assert expected is not None
             await self._async_send(payload)
             if not await self._async_confirm_primary_state(
-                lambda: self._effect_state == expected
+                lambda: _effect_state_matches(self._effect_state, expected)
             ):
                 raise AmaranConnectionError(
                     f"{self.name} did not confirm its effect rate"
@@ -1413,7 +1463,7 @@ class AmaranLight:
             assert expected is not None
             await self._async_send(payload)
             if not await self._async_confirm_primary_state(
-                lambda: self._effect_state == expected
+                lambda: _effect_state_matches(self._effect_state, expected)
             ):
                 raise AmaranConnectionError(
                     f"{self.name} did not confirm its effect colour temperature"
@@ -1442,7 +1492,7 @@ class AmaranLight:
             assert expected is not None
             await self._async_send(payload)
             if not await self._async_confirm_primary_state(
-                lambda: self._effect_state == expected
+                lambda: _effect_state_matches(self._effect_state, expected)
             ):
                 raise AmaranConnectionError(
                     f"{self.name} did not confirm its effect hue"
@@ -1473,7 +1523,7 @@ class AmaranLight:
             assert expected is not None
             await self._async_send(payload)
             if not await self._async_confirm_primary_state(
-                lambda: self._effect_state == expected
+                lambda: _effect_state_matches(self._effect_state, expected)
             ):
                 raise AmaranConnectionError(
                     f"{self.name} did not confirm its effect saturation"
@@ -1522,7 +1572,7 @@ class AmaranLight:
             assert expected is not None
             await self._async_send(payload)
             if not await self._async_confirm_primary_state(
-                lambda: self._effect_state == expected
+                lambda: _effect_state_matches(self._effect_state, expected)
             ):
                 raise AmaranConnectionError(
                     f"{self.name} did not confirm its effect green/magenta shift"
@@ -1543,7 +1593,7 @@ class AmaranLight:
             assert expected is not None
             await self._async_send(payload)
             if not await self._async_confirm_primary_state(
-                lambda: self._effect_state == expected
+                lambda: _effect_state_matches(self._effect_state, expected)
             ):
                 raise AmaranConnectionError(
                     f"{self.name} did not confirm its effect colour preset"
@@ -1593,7 +1643,7 @@ class AmaranLight:
             assert expected is not None
             await self._async_send(payload)
             if not await self._async_confirm_primary_state(
-                lambda: self._effect_state == expected
+                lambda: _effect_state_matches(self._effect_state, expected)
             ):
                 raise AmaranConnectionError(
                     f"{self.name} did not confirm its effect color mode"
@@ -1852,7 +1902,7 @@ class AmaranLight:
                     await self.async_turn_on()
                     expected_effect = replace(expected_effect, on=True)
                 if not await self._async_confirm_primary_state(
-                    lambda: self._effect_state == expected_effect
+                    lambda: _effect_state_matches(self._effect_state, expected_effect)
                 ):
                     raise AmaranConnectionError(
                         f"{self.name} did not confirm its effect state"
@@ -1881,7 +1931,9 @@ class AmaranLight:
                     or not current.on
                 ):
                     return False
-                if current.intensity != intensity and (
+                if not intensities_have_same_brightness(
+                    current.intensity, intensity
+                ) and (
                     brightness_changed or hs_color is not None or kelvin is not None
                 ):
                     return False
@@ -1892,7 +1944,9 @@ class AmaranLight:
                         and current.saturation == math.floor(hs_color[1] + 0.5)
                     )
                 if kelvin is not None:
-                    expected_kelvin = int((kelvin + 5) // 10) * 10
+                    # The app truncates positive Kelvin to the command-2 wire's
+                    # ten-Kelvin resolution before sending it.
+                    expected_kelvin = int(kelvin // 10) * 10
                     return (
                         not current.is_hsi
                         and current.kelvin == expected_kelvin
@@ -1995,7 +2049,9 @@ class AmaranLight:
                         self._state is not None
                         and not self._state.is_hsi
                         and self._state.kelvin == state.kelvin
-                        and self._state.intensity == state.intensity
+                        and intensities_have_same_brightness(
+                            self._state.intensity, state.intensity
+                        )
                         and self._state.gm == target
                         and self._state.on == state.on
                     )

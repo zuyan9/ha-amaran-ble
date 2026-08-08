@@ -21,6 +21,11 @@ from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH, DeviceIn
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import AmaranConfigEntry
+from .brightness import (
+    MAX_INTENSITY,
+    brightness_to_intensity,
+    intensity_to_brightness,
+)
 from .const import (
     CONF_MAX_KELVIN,
     CONF_MIN_KELVIN,
@@ -42,19 +47,6 @@ _LOGGER = logging.getLogger(__name__)
 # A turn-on can be a three-message transaction (parameters, power, refresh).
 # Keep entity service calls from interleaving those messages.
 PARALLEL_UPDATES = 1
-
-# The fixtures work in tenths of a percent; Home Assistant works in 0-255.
-MAX_INTENSITY = 1000
-
-
-def _to_intensity(brightness: int) -> int:
-    return max(1, round(brightness / 255 * MAX_INTENSITY))
-
-
-def _to_brightness(intensity: int) -> int:
-    # The proprietary field is ten bits wide, although the app's normal UI
-    # range ends at 1000. Keep unusual but valid reports inside HA's contract.
-    return max(1, min(255, round(intensity / MAX_INTENSITY * 255)))
 
 
 async def async_setup_entry(
@@ -141,9 +133,9 @@ class AmaranLightEntity(LightEntity):
     def brightness(self) -> int | None:
         effect = self._device.effect_state
         if effect is not None and effect.intensity is not None:
-            return _to_brightness(effect.intensity)
+            return intensity_to_brightness(effect.intensity)
         state = self._device.state
-        return None if state is None else _to_brightness(state.intensity)
+        return None if state is None else intensity_to_brightness(state.intensity)
 
     @property
     def effect(self) -> str | None:
@@ -206,7 +198,7 @@ class AmaranLightEntity(LightEntity):
             color_temp = None
 
         if brightness is not None:
-            intensity = _to_intensity(brightness)
+            intensity = brightness_to_intensity(brightness)
         elif (
             effect_state is not None
             and effect_state.intensity is not None

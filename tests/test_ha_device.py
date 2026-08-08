@@ -782,6 +782,37 @@ async def test_gm_in_cct_mode_sends_then_refreshes_with_half_up_rounding(
 
 
 @pytest.mark.asyncio
+async def test_gm_confirmation_accepts_ha_equivalent_intensity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tint-only rewrite accepts firmware quantization of held brightness."""
+    light = make_light(monkeypatch)
+    light._state = light_state(is_hsi=False, intensity=502)
+    status_requests = 0
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        nonlocal status_requests
+        del retries
+        if payload == telink.status_request():
+            status_requests += 1
+            reported_intensity = 499 if status_requests == 1 else 501
+            light._on_access_message(
+                access_message(
+                    as_report(telink.cct(4300, reported_intensity, 3), on=True)
+                )
+            )
+
+    light._async_send = AsyncMock(side_effect=send)
+
+    await light.async_set_gm(3)
+
+    assert status_requests == 2
+    assert light.state is not None
+    assert light.state.intensity == 501
+    assert light.preferred_gm == 3
+
+
+@pytest.mark.asyncio
 async def test_gm_v2_cct_preserves_tenths_and_sets_protocol_flag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1336,9 +1367,9 @@ async def test_effect_parameter_confirmation_rejects_changed_preserved_field(
             status_requests += 1
             wrong = telink.effect(
                 telink.SystemEffect.LIGHTNING,
-                intensity=321,
+                intensity=320,
                 frequency=6,
-                speed=7,
+                speed=1,
                 trigger=2,
                 kelvin=4300,
             )
@@ -1350,6 +1381,47 @@ async def test_effect_parameter_confirmation_rejects_changed_preserved_field(
         await light.async_set_effect_frequency(6)
 
     assert status_requests == 3
+
+
+@pytest.mark.asyncio
+async def test_effect_parameter_confirmation_accepts_ha_equivalent_intensity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cmd7 rewrite accepts quantization while preserving every other field."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._effect_state = telink.EffectState(
+        on=True,
+        effect=telink.SystemEffect.LIGHTNING,
+        intensity=502,
+        frequency=4,
+        speed=7,
+        trigger=2,
+        kelvin=4300,
+    )
+    status_requests = 0
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        nonlocal status_requests
+        del retries
+        if payload == telink.status_request():
+            status_requests += 1
+            report = telink.effect(
+                telink.SystemEffect.LIGHTNING,
+                intensity=501,
+                frequency=6,
+                speed=7,
+                trigger=2,
+                kelvin=4300,
+            )
+            light._on_access_message(access_message(as_report(report)))
+
+    light._async_send = AsyncMock(side_effect=send)
+
+    await light.async_set_effect_frequency(6)
+
+    assert status_requests == 1
+    assert light.effect_state is not None
+    assert light.effect_state.intensity == 501
 
 
 @pytest.mark.asyncio
@@ -1412,9 +1484,9 @@ async def test_legacy_effect_keeps_cross_generation_intensity(
 async def test_new_effect_accepts_firmware_normalized_opaque_defaults(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A firmware-chosen speed cannot turn a successful FX switch into an error."""
+    """A new cmd7 effect accepts normalized intensity and opaque defaults."""
     light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
-    light._state = light_state(is_hsi=False, intensity=10)
+    light._state = light_state(is_hsi=False, intensity=502)
 
     async def send(payload: bytes, retries: int = 3) -> None:
         del retries
@@ -1422,7 +1494,7 @@ async def test_new_effect_accepts_firmware_normalized_opaque_defaults(
             return
         normalized = telink.effect(
             telink.SystemEffect.PULSING,
-            intensity=10,
+            intensity=501,
             frequency=5,
             speed=1,
             trigger=2,
@@ -1432,10 +1504,11 @@ async def test_new_effect_accepts_firmware_normalized_opaque_defaults(
 
     light._async_send = AsyncMock(side_effect=send)
 
-    await light.async_apply_effect(telink.SystemEffect.PULSING, intensity=10)
+    await light.async_apply_effect(telink.SystemEffect.PULSING, intensity=502)
 
     assert light.effect_state is not None
     assert light.effect_state.effect is telink.SystemEffect.PULSING
+    assert light.effect_state.intensity == 501
     assert light.effect_state.speed == 1
 
 
@@ -1518,6 +1591,48 @@ async def test_sleeping_effect_exit_restores_parameters_before_power(
     ]
 
 
+@pytest.mark.parametrize(
+    ("target_intensity", "reported_intensity", "succeeds"),
+    [(502, 501, True), (500, 499, False)],
+)
+@pytest.mark.asyncio
+async def test_effect_exit_confirms_implicit_target_in_ha_brightness_domain(
+    monkeypatch: pytest.MonkeyPatch,
+    target_intensity: int,
+    reported_intensity: int,
+    succeeds: bool,
+) -> None:
+    """Effect exit accepts quantization but rejects another published brightness."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._state = light_state(is_hsi=False, intensity=target_intensity)
+    light._effect_state = telink.EffectState(
+        on=True,
+        effect=telink.SystemEffect.TV,
+        intensity=200,
+        frequency=5,
+    )
+    status_requests = 0
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        nonlocal status_requests
+        del retries
+        if payload == telink.status_request():
+            status_requests += 1
+            light._on_access_message(
+                access_message(as_report(telink.cct(4300, reported_intensity), on=True))
+            )
+
+    light._async_send = AsyncMock(side_effect=send)
+
+    if succeeds:
+        await light.async_apply_effect("off")
+        assert status_requests == 1
+    else:
+        with pytest.raises(device.AmaranConnectionError, match="leaving its effect"):
+            await light.async_apply_effect("off")
+        assert status_requests == 3
+
+
 @pytest.mark.asyncio
 async def test_steady_parameter_exits_sleeping_effect_and_wakes_last(
     monkeypatch: pytest.MonkeyPatch,
@@ -1544,6 +1659,121 @@ async def test_steady_parameter_exits_sleeping_effect_and_wakes_last(
         telink.cct(3200, 100),
         telink.onoff(True),
     ]
+
+
+@pytest.mark.asyncio
+async def test_steady_turn_on_accepts_one_step_firmware_intensity_quantization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A one-tenth-percent Ace normalization still confirms the HA request."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._state = light_state(is_hsi=False, on=True, intensity=100)
+    status_requests = 0
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        nonlocal status_requests
+        del retries
+        if payload == telink.status_request():
+            status_requests += 1
+            light._on_access_message(
+                access_message(as_report(telink.cct(4500, 501), on=True))
+            )
+
+    light._async_send = AsyncMock(side_effect=send)
+
+    await light.async_apply_turn_on(
+        intensity=502,
+        brightness_changed=True,
+        kelvin=4500,
+    )
+
+    assert status_requests == 1
+    assert light.state is not None and light.state.intensity == 501
+
+
+@pytest.mark.asyncio
+async def test_brightness_only_write_accepts_same_ha_brightness_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Command 15 uses the same user-visible confirmation contract."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._state = light_state(is_hsi=False, on=True, intensity=100)
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        del retries
+        if payload == telink.status_request():
+            light._on_access_message(
+                access_message(as_report(telink.cct(4500, 501), on=True))
+            )
+
+    light._async_send = AsyncMock(side_effect=send)
+
+    await light.async_apply_turn_on(
+        intensity=502,
+        brightness_changed=True,
+    )
+
+    assert [call.args[0] for call in light._async_send.await_args_list] == [
+        telink.brightness(502),
+        telink.status_request(),
+    ]
+    assert light.state is not None and light.state.intensity == 501
+
+
+@pytest.mark.asyncio
+async def test_steady_turn_on_rejects_larger_intensity_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even a one-step raw change must fail across an HA brightness boundary."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._state = light_state(is_hsi=False, on=True, intensity=100)
+    status_requests = 0
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        nonlocal status_requests
+        del retries
+        if payload == telink.status_request():
+            status_requests += 1
+            light._on_access_message(
+                access_message(as_report(telink.cct(4500, 499), on=True))
+            )
+
+    light._async_send = AsyncMock(side_effect=send)
+
+    with pytest.raises(device.AmaranConnectionError, match="requested light state"):
+        await light.async_apply_turn_on(
+            intensity=500,
+            brightness_changed=True,
+            kelvin=4500,
+        )
+
+    assert status_requests == 3
+
+
+@pytest.mark.asyncio
+async def test_steady_turn_on_confirms_truncated_command2_kelvin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Confirmation uses the app's positive-Kelvin integer division."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._state = light_state(is_hsi=False, on=True, intensity=100)
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        del retries
+        if payload == telink.status_request():
+            light._on_access_message(
+                access_message(as_report(telink.cct(4509, 502), on=True))
+            )
+
+    light._async_send = AsyncMock(side_effect=send)
+
+    await light.async_apply_turn_on(
+        intensity=502,
+        brightness_changed=True,
+        kelvin=4509,
+    )
+
+    assert light.state is not None and light.state.kelvin == 4500
 
 
 @pytest.mark.asyncio
@@ -1643,7 +1873,7 @@ async def test_invalid_effect_is_a_controlled_connection_error(
 async def test_cataloged_system_effect2_selects_and_confirms_real_report(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A default-safe command-34 effect is selectable through the light API."""
+    """A default-safe cmd34 effect accepts a brightness-equivalent report."""
     profile = get_fixture_profile_by_product_id("000G5")
     light = make_light(monkeypatch, profile=profile)
     light._proxy = Mock()
@@ -1654,18 +1884,34 @@ async def test_cataloged_system_effect2_selects_and_confirms_real_report(
         nonlocal latest
         del retries
         if payload[9] & 0x7F == systemfx2.CMD_SYSTEM_EFFECT_2:
-            latest = as_report(payload)
+            requested = systemfx2.decode_effect2(payload)
+            assert requested is not None
+            latest = as_report(
+                systemfx2.effect2(
+                    requested.effect,
+                    on=requested.on,
+                    intensity=501,
+                    frequency=requested.frequency,
+                    speed=requested.speed,
+                    mode=requested.mode,
+                    kelvin=requested.kelvin,
+                    gm=requested.gm,
+                    hue=requested.hue,
+                    saturation=requested.saturation,
+                    center_kelvin=requested.center_kelvin,
+                )[0]
+            )
             light._on_access_message(access_message(latest))
         elif payload == telink.status_request() and latest is not None:
             light._on_access_message(access_message(latest))
 
     light._async_send = AsyncMock(side_effect=send)
 
-    await light.async_apply_effect("Lightning II", intensity=321)
+    await light.async_apply_effect("Lightning II", intensity=502)
 
     assert light.effect2_state is not None
     assert light.effect2_state.effect is systemfx2.SystemEffect2.LIGHTNING_II
-    assert light.effect2_state.intensity == 321
+    assert light.effect2_state.intensity == 501
     assert light.effect_state is light.effect2_state
     assert light.available
 
@@ -1759,6 +2005,58 @@ async def test_system_effect2_brightness_rejects_reset_preserved_fields(
 
     with pytest.raises(device.AmaranConnectionError, match="did not confirm"):
         await light.async_apply_turn_on(intensity=500, brightness_changed=True)
+
+
+@pytest.mark.asyncio
+async def test_system_effect2_parameter_accepts_ha_equivalent_intensity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cmd34 parameter rewrite normalizes only its global intensity."""
+    profile = get_fixture_profile_by_product_id("000G5")
+    light = make_light(monkeypatch, profile=profile)
+    initial = as_report(
+        systemfx2.effect2(
+            systemfx2.SystemEffect2.LIGHTNING_II,
+            intensity=502,
+            frequency=5,
+            speed=7,
+            mode=1,
+            hue=120,
+            saturation=75,
+            center_kelvin=5600,
+        )[0]
+    )
+    light._on_access_message(access_message(initial))
+    quantized = as_report(
+        systemfx2.effect2(
+            systemfx2.SystemEffect2.LIGHTNING_II,
+            intensity=501,
+            frequency=8,
+            speed=7,
+            mode=1,
+            hue=120,
+            saturation=75,
+            center_kelvin=5600,
+        )[0]
+    )
+    status_requests = 0
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        nonlocal status_requests
+        del retries
+        if payload == telink.status_request():
+            status_requests += 1
+            light._on_access_message(access_message(quantized))
+
+    light._async_send = AsyncMock(side_effect=send)
+
+    await light.async_set_effect_frequency(8)
+
+    assert status_requests == 1
+    assert light.effect2_state is not None
+    assert light.effect2_state.intensity == 501
+    assert light.effect2_state.frequency == 8
+    assert light.effect2_state.speed == 7
 
 
 @pytest.mark.asyncio
@@ -2196,6 +2494,109 @@ async def test_pixel_brightness_rejects_an_incomplete_reported_program(
         await light.async_apply_turn_on(intensity=500, brightness_changed=True)
 
     light._async_send.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("requested_intensity", "reported_intensity", "succeeds"),
+    [(502, 501, True), (500, 499, False)],
+)
+@pytest.mark.asyncio
+async def test_rainbow_brightness_confirmation_uses_ha_buckets(
+    monkeypatch: pytest.MonkeyPatch,
+    requested_intensity: int,
+    reported_intensity: int,
+    succeeds: bool,
+) -> None:
+    """Rainbow accepts quantization but not another HA brightness value."""
+    light = make_light(monkeypatch, profile=get_fixture_profile_by_product_id("000F5"))
+    initial = pixelfx.effect(pixelfx.PixelEffect.RAINBOW)[0]
+    light._on_access_message(access_message(as_report(initial)))
+    reported = as_report(
+        pixelfx.rainbow(
+            playback=pixelfx.PixelPlayback.RUNNING,
+            brightness=reported_intensity,
+            direction=0,
+            speed=100,
+        )
+    )
+    status_requests = 0
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        nonlocal status_requests
+        del retries
+        if payload == telink.status_request():
+            status_requests += 1
+            light._on_access_message(access_message(reported))
+
+    light._async_send = AsyncMock(side_effect=send)
+
+    if succeeds:
+        await light.async_apply_turn_on(
+            intensity=requested_intensity,
+            brightness_changed=True,
+        )
+        assert status_requests == 1
+        assert light.pixel_state is not None
+        assert light.pixel_state.intensity == reported_intensity
+    else:
+        with pytest.raises(device.AmaranConnectionError, match="did not confirm"):
+            await light.async_apply_turn_on(
+                intensity=requested_intensity,
+                brightness_changed=True,
+            )
+        assert status_requests == 3
+
+
+@pytest.mark.parametrize(
+    ("requested_intensity", "reported_intensity", "succeeds"),
+    [(502, 501, True), (500, 499, False), (502, None, True)],
+)
+@pytest.mark.asyncio
+async def test_multipage_pixel_brightness_confirmation_uses_fresh_pages(
+    monkeypatch: pytest.MonkeyPatch,
+    requested_intensity: int,
+    reported_intensity: int | None,
+    succeeds: bool,
+) -> None:
+    """Fresh color pages are checked; a control-only reply remains supported."""
+    light = make_light(monkeypatch, profile=get_fixture_profile_by_product_id("000F5"))
+    for payload in pixelfx.effect(pixelfx.PixelEffect.COLOR_FADE):
+        light._on_access_message(access_message(as_report(payload)))
+    assert light.pixel_state is not None
+    reported_payloads = device._pixel_payloads(
+        light.pixel_state,
+        intensity=(
+            requested_intensity if reported_intensity is None else reported_intensity
+        ),
+        on=True,
+    )
+    if reported_intensity is None:
+        reported_payloads = (reported_payloads[-1],)
+    status_requests = 0
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        nonlocal status_requests
+        del retries
+        if payload == telink.status_request():
+            status_requests += 1
+            for reported_payload in reported_payloads:
+                light._on_access_message(access_message(as_report(reported_payload)))
+
+    light._async_send = AsyncMock(side_effect=send)
+
+    if succeeds:
+        await light.async_apply_turn_on(
+            intensity=requested_intensity,
+            brightness_changed=True,
+        )
+        assert status_requests == 1
+    else:
+        with pytest.raises(device.AmaranConnectionError, match="did not confirm"):
+            await light.async_apply_turn_on(
+                intensity=requested_intensity,
+                brightness_changed=True,
+            )
+        assert status_requests == 3
 
 
 def test_pixel_continue_page_has_unknown_power_state() -> None:
