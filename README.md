@@ -26,9 +26,10 @@ No amaran account, vendor cloud service, MQTT, or vendor bridge is required.
 - Fully local power, brightness, model-specific CCT ranges, HSI colour, and
   green/magenta control where supported
 - Cataloged legacy effects and defaults-proven generation-II effects with
-  selected rate and colour parameters, plus seven multi-zone pixel effects
-- Profile-gated Boost, fan, power/runtime, firmware diagnostics, and
-  high-speed-photography controls
+  selected rate and colour parameters, including CCT/HSI effect switching,
+  plus seven multi-zone pixel effects
+- Profile-gated Boost, reported fan modes and manual fan speed, power/runtime,
+  firmware diagnostics, and high-speed-photography controls
 - Live state updates, automatic reconnection, and crash-safe Bluetooth Mesh
   sequence handling
 - Setup and model/capability options through the Home Assistant UI
@@ -88,3 +89,6 @@ profile-specific entities.
 - **Removing a light:** keep it powered on and in range while deleting the
   integration so Home Assistant can release it from the private mesh. If that
   cannot complete, factory-reset the fixture before pairing it again.
+- **Reporting experimental hardware issues:** download the integration's
+  diagnostics and use the repository's hardware bug-report form. Inspect every
+  attachment and redact full MAC addresses and Mesh keys before posting it.

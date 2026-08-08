@@ -27,7 +27,7 @@ from homeassistant.const import (
 )
 
 from custom_components.amaran_ble import light, number, select, sensor, switch
-from custom_components.amaran_ble.amaranble import highspeed, pixelfx, systemfx2
+from custom_components.amaran_ble.amaranble import highspeed, pixelfx, systemfx2, telink
 from custom_components.amaran_ble.amaranble.telink import (
     EffectState,
     LightState,
@@ -71,6 +71,8 @@ def make_entry(
         effect_saturation_available=False,
         effect_gm_available=False,
         effect_variant_options=(),
+        effect_color_mode_options=(),
+        effect_color_mode=None,
         boost_state=None,
         fan_state=None,
         available_fan_modes=(),
@@ -87,10 +89,12 @@ def make_entry(
         async_set_effect_saturation=AsyncMock(),
         async_set_effect_gm=AsyncMock(),
         async_set_effect_variant=AsyncMock(),
+        async_set_effect_color_mode=AsyncMock(),
         async_set_boost=AsyncMock(),
         async_set_boost_kelvin=AsyncMock(),
         async_set_boost_gm=AsyncMock(),
         async_set_fan_mode=AsyncMock(),
+        async_set_fan_speed=AsyncMock(),
         async_set_high_speed=AsyncMock(),
     )
     for key, value in runtime_values.items():
@@ -329,6 +333,62 @@ async def test_effect_rate_and_light_effect_forward_commands() -> None:
 
 
 @pytest.mark.asyncio
+async def test_effect_color_mode_select_follows_active_legacy_effect() -> None:
+    """A dual-color effect exposes its live CCT/HSI representation."""
+    entry = make_entry(
+        {CONF_MODEL: "ace_25c"},
+        available=True,
+        connected=True,
+        effect_state=EffectState(
+            on=True,
+            effect=SystemEffect.FAULTY_BULB,
+            intensity=180,
+            frequency=5,
+            mode=0,
+            kelvin=4300,
+            gm=100,
+        ),
+        effect_color_mode_options=("cct", "hsi"),
+        effect_color_mode="cct",
+    )
+    entity = select.AmaranEffectColorModeEntity(entry)
+
+    assert entity.available
+    assert entity.options == ["cct", "hsi"]
+    assert entity.current_option == "cct"
+
+    await entity.async_select_option("hsi")
+    entry.runtime_data.async_set_effect_color_mode.assert_awaited_once_with("hsi")
+
+    entry.runtime_data.effect_color_mode_options = ()
+    entry.runtime_data.effect_color_mode = None
+    assert not entity.available
+    assert entity.current_option is None
+
+
+@pytest.mark.asyncio
+async def test_full_color_profile_registers_effect_color_mode_select(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A named dual-mode fixture gets the selector before an effect is active."""
+
+    class Registry:
+        def async_get_entity_id(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(select.er, "async_get", lambda _hass: Registry())
+    entry = make_entry({CONF_MODEL: "ace_25c"})
+    add_entities = Mock()
+
+    await select.async_setup_entry(object(), entry, add_entities)
+
+    assert any(
+        isinstance(item, select.AmaranEffectColorModeEntity)
+        for item in add_entities.call_args.args[0]
+    )
+
+
+@pytest.mark.asyncio
 async def test_effect_and_boost_cct_numbers_use_profile_ranges() -> None:
     """Ace's app-visible CCT controls use their distinct verified ranges."""
     effect = EffectState(
@@ -477,6 +537,44 @@ async def test_boost_and_fan_entities_use_device_state() -> None:
 
 
 @pytest.mark.asyncio
+async def test_manual_fan_speed_is_report_gated_and_writable() -> None:
+    """Manual RPM is exposed only in a confirmed Manual fan session."""
+    profile = get_fixture_profile_by_product_id("000G5")
+    fan_state = telink.FanState(
+        mode=telink.FanMode.MANUAL,
+        fixture_speed=650,
+        current_temperature_raw=0,
+        high_temperature_raw=0,
+        supported_modes=(telink.FanMode.MANUAL,),
+    )
+    entry = make_entry(
+        {CONF_MODEL: profile.key},
+        available=False,
+        connected=True,
+        fan_state=fan_state,
+    )
+    entity = number.AmaranFanManualSpeedEntity(entry)
+
+    assert entity.available
+    assert entity.native_value == 650
+    assert entity.native_min_value == 0
+    assert entity.native_max_value == 1000
+    assert entity.native_unit_of_measurement == REVOLUTIONS_PER_MINUTE
+    assert entity.entity_category is EntityCategory.CONFIG
+    await entity.async_set_native_value(725.4)
+    entry.runtime_data.async_set_fan_speed.assert_awaited_once_with(725.4)
+
+    entry.runtime_data.fan_state = telink.FanState(
+        mode=telink.FanMode.SMART,
+        fixture_speed=650,
+        current_temperature_raw=0,
+        high_temperature_raw=0,
+        supported_modes=(telink.FanMode.MANUAL, telink.FanMode.SMART),
+    )
+    assert not entity.available
+
+
+@pytest.mark.asyncio
 async def test_high_speed_photography_switch_uses_catalog_limits() -> None:
     """Cataloged command-53 models expose a typed local-mode switch."""
     profile = get_fixture_profile_by_product_id("40145")
@@ -531,6 +629,29 @@ async def test_system_effect2_profile_registers_its_parameter_entities(
     )
     assert any(
         isinstance(item, number.AmaranEffectGreenMagentaEntity) for item in entities
+    )
+    assert any(isinstance(item, number.AmaranFanManualSpeedEntity) for item in entities)
+
+
+@pytest.mark.asyncio
+async def test_ace_does_not_register_an_unsupported_manual_fan_number(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ace's verified Silent/Smart fan report must not create a dead RPM control."""
+
+    class Registry:
+        def async_get_entity_id(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(number.er, "async_get", lambda _hass: Registry())
+    entry = make_entry({CONF_MODEL: PROFILE_ACE_25X})
+    add_entities = Mock()
+
+    await number.async_setup_entry(object(), entry, add_entities)
+
+    assert not any(
+        isinstance(item, number.AmaranFanManualSpeedEntity)
+        for item in add_entities.call_args.args[0]
     )
 
 
@@ -753,9 +874,11 @@ async def test_generic_profile_removes_every_model_specific_entity(
         f"{address}_effect_gm",
         f"{address}_boost_cct",
         f"{address}_boost_gm",
+        f"{address}_fan_manual_speed",
         f"{address}_fan_mode",
         f"{address}_effect_rate",
         f"{address}_effect_color",
+        f"{address}_effect_color_mode",
         f"{address}_battery",
         f"{address}_remaining_runtime",
         f"{address}_power_source",

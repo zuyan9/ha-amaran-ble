@@ -93,6 +93,9 @@
       "effect_saturation": {
         "name": "Effect saturation"
       },
+      "fan_manual_speed": {
+        "name": "Manual fan speed"
+      },
       "green_magenta": {
         "name": "Green/magenta"
       }
@@ -110,6 +113,13 @@
           "red_blue": "Red + blue",
           "red_blue_white": "Red + blue + white",
           "warmer": "Warmer"
+        }
+      },
+      "effect_color_mode": {
+        "name": "Effect color mode",
+        "state": {
+          "cct": "CCT",
+          "hsi": "HSI"
         }
       },
       "effect_rate": {

@@ -44,6 +44,18 @@ MAX_MISSED_POLLS = 3
 OPTIONAL_REPORT_TIMEOUT = 0.8
 FAN_APPLY_SETTLE = 0.2
 
+EFFECT_COLOR_MODE_CCT = "cct"
+EFFECT_COLOR_MODE_HSI = "hsi"
+LEGACY_DUAL_COLOR_EFFECTS = frozenset(
+    {
+        telink.SystemEffect.FAULTY_BULB,
+        telink.SystemEffect.PULSING,
+        telink.SystemEffect.STROBE,
+        telink.SystemEffect.EXPLOSION,
+        telink.SystemEffect.WELDING,
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class PixelRuntimeState:
@@ -616,6 +628,32 @@ class AmaranLight:
             )
         return ()
 
+    @property
+    def effect_color_mode_options(self) -> tuple[str, ...]:
+        """Return color representations supported by the active legacy effect."""
+        state = self._effect_state
+        if (
+            state is None
+            or not state.on
+            or state.effect not in LEGACY_DUAL_COLOR_EFFECTS
+        ):
+            return ()
+        options: list[str] = []
+        if self.profile.supports_cct:
+            options.append(EFFECT_COLOR_MODE_CCT)
+        if self.profile.supports_color:
+            options.append(EFFECT_COLOR_MODE_HSI)
+        return tuple(options)
+
+    @property
+    def effect_color_mode(self) -> str | None:
+        """Return the active legacy effect's CCT or HSI representation."""
+        state = self._effect_state
+        if state is None or not state.on:
+            return None
+        mode = EFFECT_COLOR_MODE_HSI if state.mode == 1 else EFFECT_COLOR_MODE_CCT
+        return mode if mode in self.effect_color_mode_options else None
+
     @callback
     def add_listener(self, listener: Callable[[], None]) -> Callable[[], None]:
         self._listeners.append(listener)
@@ -736,6 +774,7 @@ class AmaranLight:
         frequency: float | None = None,
         kelvin: float | None = None,
         variant: float | None = None,
+        mode: float | None = None,
         hue: float | None = None,
         saturation: float | None = None,
         gm: float | None = None,
@@ -746,7 +785,11 @@ class AmaranLight:
             state.effect,
             intensity=state.intensity if intensity is None else intensity,
             frequency=state.frequency if frequency is None else frequency,
-            speed=state.speed or None,
+            speed=(
+                state.speed
+                if state.effect is telink.SystemEffect.WELDING
+                else state.speed or None
+            ),
             trigger=state.trigger,
             kelvin=(
                 state.kelvin or self._default_effect_kelvin()
@@ -754,7 +797,7 @@ class AmaranLight:
                 else kelvin
             ),
             variant=state.variant if variant is None else variant,
-            mode=state.mode,
+            mode=state.mode if mode is None else mode,
             hue=(state.hue or 0) if hue is None else hue,
             saturation=state.saturation if saturation is None else saturation,
             gm=(state.gm if state.gm is not None else 100) if gm is None else gm,
@@ -946,24 +989,26 @@ class AmaranLight:
                         )
                     )
                 )
+                dual_color_effect = selected in LEGACY_DUAL_COLOR_EFFECTS
+                use_hsi = (
+                    dual_color_effect
+                    and self.profile.supports_color
+                    and (self._state is None or self._state.is_hsi)
+                )
+                gm_v2 = bool(
+                    self.profile.catalog_capabilities.steady_color.gm_v2_version
+                )
+                effect_gm = (
+                    math.floor((self._preferred_gm + 10.0) * 10 + 0.5)
+                    if gm_v2
+                    else 10 * math.floor((self._preferred_gm + 10.0) + 0.5)
+                )
                 payload = telink.effect(
                     selected,
                     intensity=expected_intensity,
                     frequency=5,
                     kelvin=self._default_effect_kelvin(),
-                    mode=(
-                        1
-                        if self.profile.supports_color
-                        and selected
-                        in {
-                            telink.SystemEffect.FAULTY_BULB,
-                            telink.SystemEffect.PULSING,
-                            telink.SystemEffect.STROBE,
-                            telink.SystemEffect.EXPLOSION,
-                            telink.SystemEffect.WELDING,
-                        }
-                        else 0
-                    ),
+                    mode=1 if use_hsi else 0,
                     hue=(
                         self._state.hue
                         if self._state is not None and self._state.is_hsi
@@ -974,9 +1019,8 @@ class AmaranLight:
                         if self._state is not None and self._state.is_hsi
                         else 100
                     ),
-                    gm_flag=bool(
-                        self.profile.catalog_capabilities.steady_color.gm_v2_version
-                    ),
+                    gm=effect_gm,
+                    gm_flag=gm_v2,
                 )
             expected_effect = telink.decode_effect(payload)
             assert expected_effect is not None
@@ -1434,6 +1478,56 @@ class AmaranLight:
                     f"{self.name} did not confirm its effect colour preset"
                 )
 
+    async def async_set_effect_color_mode(self, mode: str) -> None:
+        """Switch a dual-color legacy effect between CCT and HSI exactly."""
+        async with self._operation_lock:
+            state = self._effect_state
+            if (
+                state is None
+                or not state.on
+                or mode not in self.effect_color_mode_options
+            ):
+                raise AmaranConnectionError(
+                    f"{mode!r} is not available for the active effect"
+                )
+
+            target_mode = 1 if mode == EFFECT_COLOR_MODE_HSI else 0
+            payload_kwargs: dict[str, float | int | bool] = {"mode": target_mode}
+            if target_mode == 1 and state.mode != 1:
+                steady = self._state
+                payload_kwargs["hue"] = (
+                    steady.hue if steady is not None and steady.is_hsi else 0
+                )
+                payload_kwargs["saturation"] = (
+                    steady.saturation if steady is not None and steady.is_hsi else 100
+                )
+            elif target_mode == 0 and state.mode != 0:
+                gm_v2 = bool(
+                    self.profile.catalog_capabilities.steady_color.gm_v2_version
+                )
+                payload_kwargs.update(
+                    {
+                        "kelvin": self._default_effect_kelvin(),
+                        "gm": (
+                            math.floor((self._preferred_gm + 10.0) * 10 + 0.5)
+                            if gm_v2
+                            else 10 * math.floor((self._preferred_gm + 10.0) + 0.5)
+                        ),
+                        "gm_flag": gm_v2,
+                    }
+                )
+
+            payload = self._effect_payload(state, **payload_kwargs)
+            expected = telink.decode_effect(payload)
+            assert expected is not None
+            await self._async_send(payload)
+            if not await self._async_confirm_primary_state(
+                lambda: self._effect_state == expected
+            ):
+                raise AmaranConnectionError(
+                    f"{self.name} did not confirm its effect color mode"
+                )
+
     async def async_set_boost(self, enabled: bool) -> None:
         """Enter or leave the Ace Boost modal session after a Mesh write."""
         if not self.profile.supports_boost:
@@ -1560,6 +1654,47 @@ class AmaranLight:
             ):
                 raise AmaranConnectionError(
                     f"{self.name} did not confirm fan mode {mode}"
+                )
+
+    async def async_set_fan_speed(self, speed_rpm: float) -> None:
+        """Set and confirm the target speed while Manual fan mode is active."""
+        if telink.FanMode.MANUAL.value not in self.profile.fan_modes:
+            raise AmaranConnectionError(
+                f"manual fan control is not enabled for {self.name}"
+            )
+        async with self._operation_lock:
+            if self._fan_state is None and not await self._async_refresh_optional(
+                telink.fan_request(), self._fan_received
+            ):
+                raise AmaranConnectionError(f"{self.name} did not report fan state")
+            if (
+                self._fan_state is None
+                or telink.FanMode.MANUAL not in self._fan_state.supported_modes
+            ):
+                raise AmaranConnectionError(
+                    f"manual fan speed is not supported by {self.name}"
+                )
+            if self._fan_state.mode is not telink.FanMode.MANUAL:
+                raise AmaranConnectionError(
+                    f"select Manual fan mode on {self.name} before changing its speed"
+                )
+
+            target = max(0, min(1000, math.floor(speed_rpm + 0.5)))
+            self._fan_received.clear()
+            await self._async_send(telink.fan(telink.FanMode.MANUAL, target))
+            await asyncio.sleep(FAN_APPLY_SETTLE)
+            confirmed = await self._async_refresh_optional(
+                telink.fan_request(), self._fan_received
+            )
+            if (
+                not confirmed
+                or self._fan_state is None
+                or self._fan_state.mode is not telink.FanMode.MANUAL
+                or self._fan_state.fixture_speed != target
+                or telink.FanMode.MANUAL not in self._fan_state.supported_modes
+            ):
+                raise AmaranConnectionError(
+                    f"{self.name} did not confirm manual fan speed {target} RPM"
                 )
 
     async def async_apply_turn_on(

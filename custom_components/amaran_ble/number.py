@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 from homeassistant.components.number import NumberEntity, NumberMode
-from homeassistant.const import CONF_ADDRESS, Platform, UnitOfTemperature
+from homeassistant.const import (
+    CONF_ADDRESS,
+    REVOLUTIONS_PER_MINUTE,
+    EntityCategory,
+    Platform,
+    UnitOfTemperature,
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_registry as er
@@ -11,7 +17,7 @@ from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH, DeviceIn
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import AmaranConfigEntry
-from .amaranble import systemfx2
+from .amaranble import systemfx2, telink
 from .const import (
     CONF_SUPPORTS_CCT,
     CONF_SUPPORTS_GM,
@@ -61,6 +67,10 @@ def _boost_cct_unique_id(address: str) -> str:
 
 def _boost_gm_unique_id(address: str) -> str:
     return f"{address}_boost_gm"
+
+
+def _fan_manual_speed_unique_id(address: str) -> str:
+    return f"{address}_fan_manual_speed"
 
 
 def _remove_registered_entity(hass: HomeAssistant, unique_id: str) -> None:
@@ -169,6 +179,11 @@ async def async_setup_entry(
         entities.append(AmaranBoostGreenMagentaEntity(entry))
     else:
         _remove_registered_entity(hass, _boost_gm_unique_id(address))
+
+    if telink.FanMode.MANUAL.value in profile.fan_modes:
+        entities.append(AmaranFanManualSpeedEntity(entry))
+    else:
+        _remove_registered_entity(hass, _fan_manual_speed_unique_id(address))
 
     if entities:
         async_add_entities(entities)
@@ -483,5 +498,62 @@ class AmaranBoostGreenMagentaEntity(NumberEntity):
     async def async_set_native_value(self, value: float) -> None:
         try:
             await self._device.async_set_boost_gm(value)
+        except AmaranConnectionError as err:
+            raise HomeAssistantError(str(err)) from err
+
+
+class AmaranFanManualSpeedEntity(NumberEntity):
+    """Manual fan target reported and confirmed by compatible fixtures."""
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "fan_manual_speed"
+    _attr_icon = "mdi:fan-speed-1"
+    _attr_should_poll = False
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_native_min_value = 0
+    _attr_native_max_value = 1000
+    _attr_native_step = 1
+    _attr_native_unit_of_measurement = REVOLUTIONS_PER_MINUTE
+    _attr_mode = NumberMode.BOX
+
+    def __init__(self, entry: AmaranConfigEntry) -> None:
+        self._device: AmaranLight = entry.runtime_data
+        address = entry.data[CONF_ADDRESS]
+        self._attr_unique_id = _fan_manual_speed_unique_id(address)
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, address)},
+            connections={(CONNECTION_BLUETOOTH, address)},
+            manufacturer=self._device.profile.manufacturer or MANUFACTURER,
+            name=entry.title,
+        )
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(self._device.add_listener(self._handle_update))
+
+    @callback
+    def _handle_update(self) -> None:
+        self.async_write_ha_state()
+
+    @property
+    def available(self) -> bool:
+        state = self._device.fan_state
+        return (
+            self._device.connected
+            and state is not None
+            and state.mode is telink.FanMode.MANUAL
+            and telink.FanMode.MANUAL in state.supported_modes
+            and 0 <= state.fixture_speed <= 1000
+        )
+
+    @property
+    def native_value(self) -> int | None:
+        state = self._device.fan_state
+        if state is None or not 0 <= state.fixture_speed <= 1000:
+            return None
+        return state.fixture_speed
+
+    async def async_set_native_value(self, value: float) -> None:
+        try:
+            await self._device.async_set_fan_speed(value)
         except AmaranConnectionError as err:
             raise HomeAssistantError(str(err)) from err

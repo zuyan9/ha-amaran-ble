@@ -771,6 +771,89 @@ async def test_full_color_profile_selects_and_preserves_legacy_hsi_effect(
 
 
 @pytest.mark.asyncio
+async def test_full_color_profile_defaults_legacy_effect_to_steady_cct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A full-color fixture's CCT look must not be changed to HSI by FX entry."""
+    light = make_light(monkeypatch, profile=get_fixture_profile("ace_25c"))
+    light._state = light_state(is_hsi=False, gm=-2)
+    light._preferred_gm = -2
+    light._async_send = AsyncMock()
+    light._async_confirm_primary_state = AsyncMock(return_value=True)
+
+    await light.async_apply_effect(telink.SystemEffect.FAULTY_BULB)
+
+    selected = telink.decode_effect(light._async_send.await_args.args[0])
+    assert selected is not None
+    assert selected.mode == 0
+    assert selected.kelvin == 4300
+    assert selected.gm == 80
+    assert selected.hue is None
+    assert selected.saturation is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_effect_color_mode_switch_preserves_and_confirms_exact_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Switching CCT/HSI keeps common fields and requires the exact fresh report."""
+    light = make_light(monkeypatch, profile=get_fixture_profile("ace_25c"))
+    light._state = light_state(is_hsi=True)
+    light._effect_state = telink.EffectState(
+        on=True,
+        effect=telink.SystemEffect.WELDING,
+        intensity=320,
+        frequency=4,
+        speed=0,
+        trigger=2,
+        mode=0,
+        kelvin=4300,
+        gm=100,
+    )
+    light._async_send = AsyncMock()
+    light._async_confirm_primary_state = AsyncMock(return_value=True)
+
+    assert light.effect_color_mode_options == ("cct", "hsi")
+    assert light.effect_color_mode == "cct"
+    await light.async_set_effect_color_mode("hsi")
+
+    switched = telink.decode_effect(light._async_send.await_args.args[0])
+    assert switched == telink.EffectState(
+        on=True,
+        effect=telink.SystemEffect.WELDING,
+        intensity=320,
+        frequency=4,
+        speed=0,
+        trigger=2,
+        mode=1,
+        hue=120,
+        saturation=75,
+    )
+    predicate = light._async_confirm_primary_state.await_args.args[0]
+    light._effect_state = replace(switched, frequency=5)
+    assert not predicate()
+    light._effect_state = switched
+    assert predicate()
+
+    light._state = light_state(is_hsi=False, gm=-2)
+    light._preferred_gm = -2
+    light._async_send.reset_mock()
+    await light.async_set_effect_color_mode("cct")
+    restored = telink.decode_effect(light._async_send.await_args.args[0])
+    assert restored == telink.EffectState(
+        on=True,
+        effect=telink.SystemEffect.WELDING,
+        intensity=320,
+        frequency=4,
+        speed=0,
+        trigger=2,
+        mode=0,
+        kelvin=4300,
+        gm=80,
+    )
+
+
+@pytest.mark.asyncio
 async def test_welding_hue_and_saturation_preserve_complete_hsi_packet(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2028,6 +2111,73 @@ async def test_manual_fan_mode_preserves_reported_speed(
     await light.async_set_fan_mode("manual")
 
     light._async_send.assert_awaited_once_with(telink.fan(telink.FanMode.MANUAL, 650))
+
+
+@pytest.mark.asyncio
+async def test_manual_fan_speed_requires_mode_and_fresh_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Manual RPM writes clamp and succeed only after an exact fresh report."""
+    light = make_light(monkeypatch, profile=get_fixture_profile_by_product_id("000G5"))
+    light._fan_state = telink.FanState(
+        telink.FanMode.MANUAL,
+        fixture_speed=650,
+        current_temperature_raw=0,
+        high_temperature_raw=0,
+        supported_modes=(telink.FanMode.MANUAL,),
+    )
+    light._async_send = AsyncMock()
+
+    async def refresh(*_args: object) -> bool:
+        light._fan_state = telink.FanState(
+            telink.FanMode.MANUAL,
+            fixture_speed=1000,
+            current_temperature_raw=0,
+            high_temperature_raw=0,
+            supported_modes=(telink.FanMode.MANUAL,),
+        )
+        return True
+
+    light._async_refresh_optional = AsyncMock(side_effect=refresh)
+    monkeypatch.setattr(device.asyncio, "sleep", AsyncMock())
+
+    await light.async_set_fan_speed(1000.6)
+
+    light._async_send.assert_awaited_once_with(telink.fan(telink.FanMode.MANUAL, 1000))
+    light._async_refresh_optional.assert_awaited_once_with(
+        telink.fan_request(), light._fan_received
+    )
+
+    light._fan_state = telink.FanState(
+        telink.FanMode.SMART,
+        fixture_speed=650,
+        current_temperature_raw=0,
+        high_temperature_raw=0,
+        supported_modes=(telink.FanMode.MANUAL, telink.FanMode.SMART),
+    )
+    with pytest.raises(device.AmaranConnectionError, match="select Manual"):
+        await light.async_set_fan_speed(500)
+
+
+@pytest.mark.asyncio
+async def test_manual_fan_speed_rejects_stale_or_wrong_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale cached RPM cannot confirm an unanswered target-speed write."""
+    light = make_light(monkeypatch, profile=get_fixture_profile_by_product_id("000G5"))
+    light._fan_state = telink.FanState(
+        telink.FanMode.MANUAL,
+        fixture_speed=650,
+        current_temperature_raw=0,
+        high_temperature_raw=0,
+        supported_modes=(telink.FanMode.MANUAL,),
+    )
+    light._async_send = AsyncMock()
+    light._async_refresh_optional = AsyncMock(return_value=True)
+    monkeypatch.setattr(device.asyncio, "sleep", AsyncMock())
+
+    with pytest.raises(device.AmaranConnectionError, match="did not confirm"):
+        await light.async_set_fan_speed(700)
 
 
 def test_write_form_pages_cannot_confirm_their_own_commands(

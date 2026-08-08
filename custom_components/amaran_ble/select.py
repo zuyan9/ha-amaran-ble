@@ -13,7 +13,11 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from . import AmaranConfigEntry
 from .amaranble.telink import SystemEffect
 from .const import DOMAIN, MANUFACTURER
-from .device import AmaranConnectionError, AmaranLight
+from .device import (
+    LEGACY_DUAL_COLOR_EFFECTS,
+    AmaranConnectionError,
+    AmaranLight,
+)
 from .profiles import profile_for_entry
 
 PARALLEL_UPDATES = 1
@@ -29,6 +33,10 @@ def _effect_rate_unique_id(address: str) -> str:
 
 def _effect_color_unique_id(address: str) -> str:
     return f"{address}_effect_color"
+
+
+def _effect_color_mode_unique_id(address: str) -> str:
+    return f"{address}_effect_color_mode"
 
 
 async def async_setup_entry(
@@ -61,6 +69,21 @@ async def async_setup_entry(
             entity_id = registry.async_get_entity_id(Platform.SELECT, DOMAIN, unique_id)
             if entity_id is not None:
                 registry.async_remove(entity_id)
+
+    supports_effect_color_mode = (
+        profile.supports_cct
+        and profile.supports_color
+        and any(effect.value in profile.effects for effect in LEGACY_DUAL_COLOR_EFFECTS)
+    )
+    if supports_effect_color_mode:
+        entities.append(AmaranEffectColorModeEntity(entry))
+    else:
+        registry = er.async_get(hass)
+        entity_id = registry.async_get_entity_id(
+            Platform.SELECT, DOMAIN, _effect_color_mode_unique_id(address)
+        )
+        if entity_id is not None:
+            registry.async_remove(entity_id)
 
     if entities:
         async_add_entities(entities)
@@ -226,5 +249,50 @@ class AmaranEffectColorEntity(SelectEntity):
     async def async_select_option(self, option: str) -> None:
         try:
             await self._device.async_set_effect_variant(option)
+        except AmaranConnectionError as err:
+            raise HomeAssistantError(str(err)) from err
+
+
+class AmaranEffectColorModeEntity(SelectEntity):
+    """Choose the CCT or HSI representation of a dual-color legacy effect."""
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "effect_color_mode"
+    _attr_icon = "mdi:palette-swatch-variant"
+    _attr_should_poll = False
+
+    def __init__(self, entry: AmaranConfigEntry) -> None:
+        self._device: AmaranLight = entry.runtime_data
+        address = entry.data[CONF_ADDRESS]
+        self._attr_unique_id = _effect_color_mode_unique_id(address)
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, address)},
+            connections={(CONNECTION_BLUETOOTH, address)},
+            manufacturer=self._device.profile.manufacturer or MANUFACTURER,
+            name=entry.title,
+        )
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(self._device.add_listener(self._handle_update))
+
+    @callback
+    def _handle_update(self) -> None:
+        self.async_write_ha_state()
+
+    @property
+    def available(self) -> bool:
+        return self._device.connected and bool(self._device.effect_color_mode_options)
+
+    @property
+    def options(self) -> list[str]:
+        return list(self._device.effect_color_mode_options)
+
+    @property
+    def current_option(self) -> str | None:
+        return self._device.effect_color_mode
+
+    async def async_select_option(self, option: str) -> None:
+        try:
+            await self._device.async_set_effect_color_mode(option)
         except AmaranConnectionError as err:
             raise HomeAssistantError(str(err)) from err

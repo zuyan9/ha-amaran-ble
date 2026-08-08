@@ -1,0 +1,159 @@
+name: Hardware bug report
+description: Report a problem with discovering, provisioning, or controlling a fixture
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve amaran BLE. Most fixture profiles are based on
+        protocol research rather than hardware testing, so exact hardware and
+        firmware details are especially useful.
+
+        GitHub issues are public. Never post Bluetooth Mesh network, application,
+        or device keys. Redact your fixture's full Bluetooth MAC address and any
+        other personal information from diagnostics, logs, screenshots, and text.
+
+  - type: input
+    id: fixture_model
+    attributes:
+      label: Fixture model
+      description: Enter the exact amaran or Aputure model name printed on the fixture or shown in Sidus Link.
+      placeholder: Ace 25x
+    validations:
+      required: true
+
+  - type: input
+    id: product_id
+    attributes:
+      label: Product ID
+      description: Enter the app/catalog product ID if known; otherwise enter "Unknown".
+      placeholder: Unknown
+    validations:
+      required: true
+
+  - type: input
+    id: integration_version
+    attributes:
+      label: amaran BLE version
+      description: Find this in HACS or the integration manifest.
+      placeholder: 0.5.0
+    validations:
+      required: true
+
+  - type: input
+    id: home_assistant_version
+    attributes:
+      label: Home Assistant version
+      placeholder: 2026.8.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: installation_type
+    attributes:
+      label: Home Assistant installation type
+      options:
+        - Home Assistant OS
+        - Home Assistant Container
+        - Home Assistant Core
+        - Home Assistant Supervised
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: fixture_versions
+    attributes:
+      label: Fixture and protocol versions
+      description: List the fixture firmware, control/driver hardware and software versions, and protocol version shown by Home Assistant or Sidus Link. Enter "Unknown" for unavailable values.
+      placeholder: |
+        Fixture firmware: Unknown
+        Control hardware/software: Unknown
+        Driver hardware/software: Unknown
+        Protocol version: Unknown
+    validations:
+      required: true
+
+  - type: textarea
+    id: bluetooth_environment
+    attributes:
+      label: Bluetooth environment
+      description: Describe the Bluetooth adapter or proxy, its approximate distance from the fixture, and whether other Bluetooth devices work through it. Do not include the full MAC address.
+      placeholder: Built-in Intel adapter, about 2 m away; no Bluetooth proxy; other BLE devices work normally.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: failure_stage
+    attributes:
+      label: Where does the problem occur?
+      options:
+        - Discovery
+        - Provisioning or initial setup
+        - Integration startup or reconnect
+        - Basic light control
+        - Effects or advanced controls
+        - Removal or factory reset
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: provisioning_state
+    attributes:
+      label: Reset and provisioning state
+      description: State whether the fixture was removed from Sidus Link, whether its Bluetooth/Mesh settings were factory-reset, and whether Home Assistant has ever provisioned it successfully.
+      placeholder: Removed from Sidus Link, factory-reset immediately before setup, and never successfully provisioned by Home Assistant.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: List the shortest sequence that reliably demonstrates the problem.
+      placeholder: |
+        1. Open Settings > Devices & services.
+        2. Add amaran BLE and select the fixture.
+        3. Select the exact model and submit.
+        4. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the exact error message, unavailable entity, or incorrect fixture behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics_logs
+    attributes:
+      label: Diagnostics and debug log
+      description: Drag a Home Assistant diagnostics file and the relevant amaran BLE debug-log excerpt here. If either is unavailable, explain why. Inspect every attachment and redact full MAC addresses, Mesh keys, and personal information before uploading.
+      placeholder: Attach files here, or explain why diagnostics or logs could not be collected.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Public-data check
+      options:
+        - label: I checked all submitted text and attachments and removed Bluetooth Mesh keys, full MAC addresses, and personal information.
+          required: true
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: Add anything else that could help, such as whether Sidus Link can still control the fixture.
