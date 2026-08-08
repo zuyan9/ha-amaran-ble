@@ -36,14 +36,6 @@ without a hard-coded model allowlist. During setup, choose whether the fixture
 supports CCT, HSI colour, and green/magenta adjustment; fixed-daylight models
 can use a brightness-only profile.
 
-The **Ace 25x** is hardware-tested. The upstream project was developed around
-the **150c** and also controls a **Halo 100x** in a three-light mesh; the Halo
-is reached through another fixture acting as the BLE Mesh proxy. Neither model
-has been verified with this integration's direct provisioning approach. Other
-single-zone Telink-based amaran/Aputure fixtures using opcode `0x26` may work,
-but remain experimental. Effects, pixel/zone control, fans, boost modes, and
-importing an existing Sidus Link mesh are not currently supported.
-
 ## Requirements
 
 - Home Assistant 2026.8.0 or newer
