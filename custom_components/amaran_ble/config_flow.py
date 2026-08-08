@@ -57,7 +57,6 @@ from .const import (
     DEFAULT_SUPPORTS_GM,
     DOMAIN,
     NODE_ADDRESS,
-    PROFILE_ACE_25X,
     PROFILE_GENERIC,
     PROVISIONER_ADDRESS,
     TELINK_ADDRESS_PREFIX,
@@ -67,7 +66,7 @@ from .pending import (
     async_get_pending,
     async_save_pending,
 )
-from .profiles import PROFILES, get_fixture_profile
+from .profiles import CATALOG_PROFILES, get_fixture_profile
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -110,15 +109,33 @@ def _kelvin_selector() -> selector.NumberSelector:
 
 
 def _model_selector() -> selector.SelectSelector:
-    """Offer only profiles whose model-specific commands are verified."""
+    """Offer the app's catalog plus a manually configurable fallback."""
+
+    def label(profile: Any) -> str:
+        name = profile.name
+        if profile.manufacturer and not name.casefold().startswith(
+            profile.manufacturer.casefold()
+        ):
+            name = f"{profile.manufacturer} {name}"
+        return f"{name} ({'hardware-tested' if profile.hardware_tested else 'experimental'})"
+
+    catalog = sorted(
+        CATALOG_PROFILES,
+        key=lambda profile: (
+            not profile.hardware_tested,
+            profile.manufacturer.casefold(),
+            profile.name.casefold(),
+        ),
+    )
     return selector.SelectSelector(
         selector.SelectSelectorConfig(
             options=[
                 selector.SelectOptionDict(
                     value=PROFILE_GENERIC, label="Generic amaran light"
                 ),
-                selector.SelectOptionDict(
-                    value=PROFILE_ACE_25X, label="amaran Ace 25x"
+                *(
+                    selector.SelectOptionDict(value=profile.key, label=label(profile))
+                    for profile in catalog
                 ),
             ],
             mode=selector.SelectSelectorMode.DROPDOWN,
@@ -128,9 +145,11 @@ def _model_selector() -> selector.SelectSelector:
 
 def options_for_profile(values: dict[str, Any]) -> dict[str, Any]:
     """Normalize form values into a safe, complete capability selection."""
-    requested_model = str(values.get(CONF_MODEL, DEFAULT_PROFILE))
-    model = requested_model if requested_model in PROFILES else DEFAULT_PROFILE
-    profile = get_fixture_profile(model)
+    requested_model = values.get(CONF_MODEL, DEFAULT_PROFILE)
+    profile = get_fixture_profile(
+        requested_model if isinstance(requested_model, str) else None
+    )
+    model = profile.key
     if model != PROFILE_GENERIC:
         return {
             CONF_MODEL: model,
@@ -157,7 +176,13 @@ def options_for_profile(values: dict[str, Any]) -> dict[str, Any]:
 
 def capability_errors(values: dict[str, Any]) -> dict[str, str]:
     """Validate the editable capability fields of the generic profile."""
-    if values.get(CONF_MODEL, DEFAULT_PROFILE) != PROFILE_GENERIC:
+    requested_model = values.get(CONF_MODEL, DEFAULT_PROFILE)
+    if (
+        get_fixture_profile(
+            requested_model if isinstance(requested_model, str) else None
+        ).key
+        != PROFILE_GENERIC
+    ):
         return {}
     supports_cct = bool(values.get(CONF_SUPPORTS_CCT, DEFAULT_SUPPORTS_CCT))
     if values.get(CONF_SUPPORTS_GM, DEFAULT_SUPPORTS_GM) and not supports_cct:
@@ -169,6 +194,22 @@ def capability_errors(values: dict[str, Any]) -> dict[str, str]:
     ):
         return {CONF_MAX_KELVIN: "invalid_range"}
     return {}
+
+
+def _options_form_values(entry: ConfigEntry) -> dict[str, Any]:
+    """Return canonical form values without losing a legacy data model."""
+    values = dict(entry.options)
+    requested_model = values.get(
+        CONF_MODEL, entry.data.get(CONF_MODEL, DEFAULT_PROFILE)
+    )
+    profile = get_fixture_profile(
+        requested_model if isinstance(requested_model, str) else None
+    )
+    if profile.key != PROFILE_GENERIC:
+        values.update(options_for_profile({CONF_MODEL: profile.key}))
+    else:
+        values[CONF_MODEL] = PROFILE_GENERIC
+    return values
 
 
 def suggested_title(info: BluetoothServiceInfoBleak) -> str:
@@ -455,7 +496,7 @@ class AmaranOptionsFlow(OptionsFlow):
             if errors := capability_errors(user_input):
                 return self._show_form(user_input, errors)
             return self.async_create_entry(data=options_for_profile(user_input))
-        return self._show_form(dict(self.config_entry.options), {})
+        return self._show_form(_options_form_values(self.config_entry), {})
 
     def _show_form(
         self, values: dict[str, Any], errors: dict[str, str]

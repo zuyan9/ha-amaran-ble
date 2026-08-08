@@ -26,7 +26,7 @@ jobs:
           --with homeassistant==2026.8.0
           --with aiousbwatcher==1.1.2
           --with serialx==1.8.2
-          python -m pytest -q tests/test_ha_*.py
+          python -m pytest -q
       - run: uv run python -m compileall -q custom_components tests
 
   hassfest:

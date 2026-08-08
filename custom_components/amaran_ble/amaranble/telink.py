@@ -28,6 +28,7 @@ CMD_VERSION = 0x00
 CMD_SYSTEM_EFFECT = 0x07
 CMD_FAN = 0x09
 CMD_POWER = 0x0A
+CMD_VERSION_2 = 0x25
 CMD_BOOST = 0x46
 
 # The wire field stores kelvin/10. Values above 10000K wrap through the 10-bit
@@ -43,18 +44,24 @@ ACE_BOOST_MAX_KELVIN = 5500
 
 
 class SystemEffect(StrEnum):
-    """Ace 25x first-generation system effects."""
+    """First-generation system effects carried by command 7."""
 
     OFF = "off"
+    CLUB_LIGHTS = "Club Lights"
     PAPARAZZI = "Paparazzi"
     FIREWORKS = "Fireworks"
     FAULTY_BULB = "Faulty Bulb"
     LIGHTNING = "Lightning"
     TV = "TV"
+    CANDLE = "Candle"
     PULSING = "Pulsing"
     STROBE = "Strobe"
     EXPLOSION = "Explosion"
     FIRE = "Fire"
+    WELDING = "Welding"
+    COP_CAR = "Cop Car"
+    COLOR_CHASE = "Color Chase"
+    PARTY_LIGHTS = "Party Lights"
 
 
 class FanMode(StrEnum):
@@ -78,14 +85,20 @@ class PowerSource(StrEnum):
 
 
 _EFFECT_IDS = {
+    SystemEffect.CLUB_LIGHTS: 0,
     SystemEffect.PAPARAZZI: 1,
     SystemEffect.LIGHTNING: 2,
     SystemEffect.TV: 3,
+    SystemEffect.CANDLE: 4,
     SystemEffect.FIRE: 5,
     SystemEffect.STROBE: 6,
     SystemEffect.EXPLOSION: 7,
     SystemEffect.FAULTY_BULB: 8,
     SystemEffect.PULSING: 9,
+    SystemEffect.WELDING: 10,
+    SystemEffect.COP_CAR: 11,
+    SystemEffect.COLOR_CHASE: 12,
+    SystemEffect.PARTY_LIGHTS: 13,
     SystemEffect.FIREWORKS: 14,
     SystemEffect.OFF: 15,
 }
@@ -120,11 +133,21 @@ _DEFAULT_EFFECT_TRIGGERS = {
     SystemEffect.EXPLOSION: 1,
     SystemEffect.FAULTY_BULB: 2,
     SystemEffect.PULSING: 2,
+    SystemEffect.WELDING: 2,
+}
+
+_DEFAULT_EFFECT_VARIANTS = {
+    # Defaults from the app's Kotlin effect models. Candle and Club use zero.
+    SystemEffect.COP_CAR: 2,
 }
 
 
 def _round_half_up(value: float) -> int:
     """Match JavaScript Math.round, including exact half ties toward +infinity."""
+    if math.isnan(value):
+        return 0
+    if math.isinf(value):
+        return (2**63 - 1) if value > 0 else -(2**63)
     return math.floor(value + 0.5)
 
 
@@ -164,6 +187,16 @@ def _clamp_round(value: float, low: int, high: int) -> int:
     return max(low, min(high, _round_half_up(value)))
 
 
+def _coarse_gm_value(app_gm: float) -> int:
+    """Match the app's asymmetric legacy 0..200 to 0..20 conversion."""
+    if math.isnan(app_gm):
+        return 0
+    value = max(0.0, min(200.0, app_gm))
+    # The APK uses Java integer division above neutral, but Math.round at and
+    # below neutral. Preserve that quirk for non-integral service inputs too.
+    return int(value / 10) if value > 100 else _round_half_up(value / 10)
+
+
 def status_request() -> bytes:
     """Ask the fixture to broadcast its current state."""
     payload = bytearray(10)
@@ -188,16 +221,36 @@ def brightness(intensity: float) -> bytes:
     return _finalize(payload)
 
 
-def cct(kelvin: float, intensity: float, gm: float = 0) -> bytes:
-    """Correlated colour temperature plus green/magenta shift (-10..+10)."""
+def cct(
+    kelvin: float,
+    intensity: float,
+    gm: float = 0,
+    *,
+    gm_flag: int | bool = 0,
+) -> bytes:
+    """Build CCT plus a coarse or G/M-v2 green/magenta shift.
+
+    The normalized G/M domain remains -10..+10. With ``gm_flag`` set, the app
+    carries tenths across its exact 0..200 model domain and the adjacent high
+    bit distinguishes values above neutral.
+    """
     value = max(0, min(MAX_INTENSITY, _round_half_up(intensity)))
 
-    # The wire field is kelvin/10 ("telink CCT"); sending raw kelvin overflows
-    # the 10-bit field. Integer-truncate to match the firmware exactly.
-    tcct = int((max(MIN_KELVIN, min(MAX_KELVIN, kelvin)) + 5) // 10)
+    # The app divides positive Kelvin by ten using Java integer division before
+    # handing the value to the protocol builder.
+    clamped_kelvin = (
+        MIN_KELVIN if math.isnan(kelvin) else max(MIN_KELVIN, min(MAX_KELVIN, kelvin))
+    )
+    tcct = int(clamped_kelvin // 10)
 
-    green = max(0, min(20, _round_half_up(gm) + 10))  # -10..+10 -> 0..20
-    gm_flag = 0
+    exact_gm = int(bool(gm_flag))
+    if exact_gm:
+        app_gm = _clamp_round((gm + 10) * 10, 0, 200)
+        gm_high = int(app_gm > 100)
+        green = app_gm - (100 if gm_high else 0)
+    else:
+        gm_high = 0
+        green = _coarse_gm_value((gm + 10) * 10)
 
     low = (value & 0x03) << 62
     high = 0x8200 | ((value >> 2) & 0xFF)
@@ -209,7 +262,8 @@ def cct(kelvin: float, intensity: float, gm: float = 0) -> bytes:
         # the 10-bit field with a +0x18 offset and marks it in bit 42.
         low |= ((tcct + 0x18) & 0x3FF) << 52
         low |= 0x0000040000000000
-    low |= (gm_flag & 0x01) << 43
+    low |= exact_gm << 43
+    low |= gm_high << 44
     low |= (green & 0x7F) << 45
 
     payload = bytearray(low.to_bytes(8, "little"))
@@ -244,7 +298,12 @@ class EffectState:
     speed: int = 0
     trigger: int = 0
     kelvin: int | None = None
+    gm: int | None = None
+    gm_flag: bool = False
     variant: int = 0
+    mode: int = 0
+    hue: int | None = None
+    saturation: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -334,6 +393,42 @@ class VersionState:
         return self.cct_high_raw * 100
 
 
+@dataclass(frozen=True, slots=True)
+class Version2State:
+    """Decoded command-37 effect, pixel, geometry, and motion capabilities."""
+
+    system_effects_2_supported: bool
+    system_effect_groups: tuple[bool, ...]
+    pixel_effects_supported: bool
+    pixel_effect_groups: tuple[bool, ...]
+    pixel_x1: int
+    pixel_y1: int
+    pixel_x2: int
+    pixel_y2: int
+    effect_active: bool
+    sleeping: bool
+    pixel_num: int
+    motion_supported: bool
+
+    @property
+    def active_system_effect_groups(self) -> tuple[str, ...]:
+        """Return the app's enabled command-34 group letters."""
+        return tuple(
+            chr(ord("A") + index)
+            for index, enabled in enumerate(self.system_effect_groups)
+            if enabled
+        )
+
+    @property
+    def active_pixel_effect_groups(self) -> tuple[str, ...]:
+        """Return the app's enabled command-33 group letters."""
+        return tuple(
+            chr(ord("A") + index)
+            for index, enabled in enumerate(self.pixel_effect_groups)
+            if enabled
+        )
+
+
 def effect_off() -> bytes:
     """Stop the active first-generation system effect."""
     return _build_payload(
@@ -347,17 +442,24 @@ def effect(
     *,
     intensity: float = 180,
     frequency: float = 5,
-    speed: float = 5,
+    speed: float | None = None,
     trigger: float | None = None,
     kelvin: float = 5600,
-    variant: float = 0,
+    gm: float = 100,
+    gm_flag: int | bool = 0,
+    variant: float | None = None,
+    mode: float | None = None,
+    hue: float = 0,
+    saturation: float | None = None,
 ) -> bytes:
-    """Build one Ace 25x first-generation CCT effect command.
+    """Build one first-generation system-effect command.
 
-    Ace does not advertise HSI or G/M support, so the multi-colour effects are
-    always encoded in their CCT mode with neutral G/M. ``variant`` is the
-    three-position colour-temperature/type selector used by TV, Fire, and
-    Fireworks.
+    ``gm`` uses the app's raw 0..200 scale, where 100 is neutral. Fixtures with
+    the app's G/M-v2 capability set ``gm_flag`` and carry the exact raw value;
+    older fixtures quantize it to ten-unit steps. Full-colour Faulty Bulb,
+    Pulsing, Strobe, Explosion, and Welding effects default to the app's HSI
+    representation while preserving either reported colour mode. ``variant``
+    is the APK's preset/colour index; saturation has its own explicit field.
     """
     selected = SystemEffect(system_effect)
     if selected is SystemEffect.OFF:
@@ -365,28 +467,104 @@ def effect(
 
     value = _clamp_round(intensity, 0, MAX_INTENSITY)
     maximum_frequency = (
-        10 if selected in {SystemEffect.FIRE, SystemEffect.EXPLOSION} else 11
+        10
+        if selected
+        in {
+            SystemEffect.CLUB_LIGHTS,
+            SystemEffect.CANDLE,
+            SystemEffect.FIRE,
+            SystemEffect.EXPLOSION,
+            SystemEffect.COLOR_CHASE,
+            SystemEffect.PARTY_LIGHTS,
+        }
+        else 11
     )
     rate = _clamp_round(frequency, 1, maximum_frequency)
-    effect_speed = _clamp_round(speed, 1, 10)
+    default_speed = 18 if selected is SystemEffect.WELDING else 5
+    effect_speed = _clamp_round(
+        default_speed if speed is None else speed,
+        0 if selected is SystemEffect.WELDING else 1,
+        127 if selected is SystemEffect.WELDING else 10,
+    )
     effect_trigger = _clamp_round(
         _DEFAULT_EFFECT_TRIGGERS.get(selected, 0) if trigger is None else trigger,
         0,
         3,
     )
-    cct_value = _clamp_round(kelvin, ACE_MIN_KELVIN, ACE_MAX_KELVIN) // 10
-    effect_variant = _clamp_round(variant, 0, 2)
+    effect_kelvin = _clamp_round(kelvin, MIN_KELVIN, MAX_KELVIN) // 10
+    high_cct = effect_kelvin > 1000
+    cct_value = effect_kelvin - 1000 if high_cct else effect_kelvin
+    effect_gm_flag = int(bool(gm_flag))
+    if effect_gm_flag:
+        raw_gm = _clamp_round(gm, 0, 200)
+        effect_gm_high = int(raw_gm > 100)
+        effect_gm = raw_gm - (100 if effect_gm_high else 0)
+    else:
+        effect_gm_high = 0
+        effect_gm = _coarse_gm_value(gm)
+    requested_variant = (
+        _DEFAULT_EFFECT_VARIANTS.get(selected, 0) if variant is None else variant
+    )
+    if selected in {
+        SystemEffect.TV,
+        SystemEffect.CANDLE,
+        SystemEffect.FIRE,
+        SystemEffect.FIREWORKS,
+    }:
+        effect_variant = _clamp_round(requested_variant, 0, 2)
+    elif selected is SystemEffect.CLUB_LIGHTS:
+        effect_variant = _clamp_round(requested_variant, 0, 7)
+    elif selected is SystemEffect.COP_CAR:
+        effect_variant = _clamp_round(requested_variant, 0, 4)
+    else:
+        effect_variant = 0
     effect_id = _EFFECT_IDS[selected]
 
     # Bit 8 is called sleepMode by the APK. A value of one means active; the
     # Kotlin model stores the inverse as a ``sleep`` boolean.
     common = ((1, 8, 1), (effect_id, 64, 8))
 
+    if selected in {SystemEffect.CLUB_LIGHTS, SystemEffect.COP_CAR}:
+        return _build_payload(
+            CMD_SYSTEM_EFFECT,
+            *common,
+            (effect_variant, 46, 4),
+            (rate, 50, 4),
+            (value, 54, 10),
+        )
+
+    if selected in {SystemEffect.COLOR_CHASE, SystemEffect.PARTY_LIGHTS}:
+        return _build_payload(
+            CMD_SYSTEM_EFFECT,
+            *common,
+            (
+                _clamp_round(100 if saturation is None else saturation, 0, 100),
+                43,
+                7,
+            ),
+            (rate, 50, 4),
+            (value, 54, 10),
+        )
+
+    if selected is SystemEffect.CANDLE:
+        # Despite the protocol field name, this is the app's three-way
+        # ``cct_type`` preset, not a colour temperature in kelvin.
+        return _build_payload(
+            CMD_SYSTEM_EFFECT,
+            *common,
+            (effect_variant, 40, 10),
+            (rate, 50, 4),
+            (value, 54, 10),
+        )
+
     if selected is SystemEffect.PAPARAZZI:
         return _build_payload(
             CMD_SYSTEM_EFFECT,
             *common,
-            (10, 33, 7),  # neutral G/M 100 is divided by ten on the wire
+            (effect_gm_flag, 31, 1),
+            (effect_gm_high, 32, 1),
+            (effect_gm, 33, 7),
+            (int(high_cct), 30, 1),
             (cct_value, 40, 10),
             (rate, 50, 4),
             (value, 54, 10),
@@ -414,34 +592,111 @@ def effect(
         return _build_payload(
             CMD_SYSTEM_EFFECT,
             *common,
+            (effect_gm_flag, 25, 1),
+            (effect_gm_high, 26, 1),
             (effect_speed, 27, 4),
             (effect_trigger, 31, 2),
-            (10, 33, 7),
+            (effect_gm, 33, 7),
+            (int(high_cct), 24, 1),
             (cct_value, 40, 10),
             (rate, 50, 4),
             (value, 54, 10),
         )
 
-    if selected in {SystemEffect.FAULTY_BULB, SystemEffect.PULSING}:
+    if selected is SystemEffect.WELDING:
+        # The app defaults Welding to HSI mode. It can also report a CCT mode;
+        # preserve either representation so subsequent parameter updates do
+        # not silently change the effect's colour mode.
+        effect_mode = _clamp_round(1 if mode is None else mode, 0, 1)
+        if effect_mode == 1:
+            return _build_payload(
+                CMD_SYSTEM_EFFECT,
+                *common,
+                (effect_speed, 21, 7),  # APK field name: min
+                (effect_trigger, 28, 2),
+                (
+                    _clamp_round(100 if saturation is None else saturation, 0, 100),
+                    30,
+                    7,
+                ),
+                (_clamp_round(hue, 0, 360), 37, 9),
+                (value, 46, 10),
+                (rate, 56, 4),
+                (effect_mode, 60, 4),
+            )
         return _build_payload(
             CMD_SYSTEM_EFFECT,
             *common,
+            (int(high_cct), 17, 1),
+            (effect_gm_flag, 18, 1),
+            (effect_gm_high, 19, 1),
+            (effect_speed, 20, 7),
+            (effect_trigger, 27, 2),
+            (effect_gm, 29, 7),
+            (cct_value, 36, 10),
+            (value, 46, 10),
+            (rate, 56, 4),
+            (effect_mode, 60, 4),
+        )
+
+    if selected in {SystemEffect.FAULTY_BULB, SystemEffect.PULSING}:
+        effect_mode = _clamp_round(1 if mode is None else mode, 0, 1)
+        if effect_mode == 1:
+            return _build_payload(
+                CMD_SYSTEM_EFFECT,
+                *common,
+                (effect_speed, 24, 4),
+                (effect_trigger, 28, 2),
+                (
+                    _clamp_round(100 if saturation is None else saturation, 0, 100),
+                    30,
+                    7,
+                ),
+                (_clamp_round(hue, 0, 360), 37, 9),
+                (value, 46, 10),
+                (rate, 56, 4),
+                (effect_mode, 60, 4),
+            )
+        return _build_payload(
+            CMD_SYSTEM_EFFECT,
+            *common,
+            (effect_gm_flag, 21, 1),
+            (effect_gm_high, 22, 1),
             (effect_speed, 23, 4),
             (effect_trigger, 27, 2),
-            (10, 29, 7),
+            (effect_gm, 29, 7),
+            (int(high_cct), 20, 1),
             (cct_value, 36, 10),
             (value, 46, 10),
             (rate, 56, 4),
             (0, 60, 4),  # effectMode 0 is the Ace-supported CCT path
         )
 
-    # Strobe and Explosion share the same CCT-mode layout. They intentionally
-    # have no speed field in this first-generation packet.
+    # Strobe and Explosion share layouts and intentionally have no speed field.
+    effect_mode = _clamp_round(1 if mode is None else mode, 0, 1)
+    if effect_mode == 1:
+        return _build_payload(
+            CMD_SYSTEM_EFFECT,
+            *common,
+            (effect_trigger, 28, 2),
+            (
+                _clamp_round(100 if saturation is None else saturation, 0, 100),
+                30,
+                7,
+            ),
+            (_clamp_round(hue, 0, 360), 37, 9),
+            (value, 46, 10),
+            (rate, 56, 4),
+            (effect_mode, 60, 4),
+        )
     return _build_payload(
         CMD_SYSTEM_EFFECT,
         *common,
+        (effect_gm_flag, 25, 1),
+        (effect_gm_high, 26, 1),
         (effect_trigger, 27, 2),
-        (10, 29, 7),
+        (effect_gm, 29, 7),
+        (int(high_cct), 24, 1),
         (cct_value, 36, 10),
         (value, 46, 10),
         (rate, 56, 4),
@@ -485,6 +740,11 @@ def version_request() -> bytes:
     return _build_payload(CMD_VERSION, write=False)
 
 
+def version2_request() -> bytes:
+    """Request advanced system-effect, pixel, geometry, and motion support."""
+    return _build_payload(CMD_VERSION_2, write=False)
+
+
 @dataclass(frozen=True)
 class LightState:
     """A decoded status report from a fixture."""
@@ -493,9 +753,10 @@ class LightState:
     is_hsi: bool
     intensity: int  # 0-1000
     kelvin: int  # CCT mode only
-    gm: int  # -10..+10, CCT mode only
+    gm: float  # -10..+10, CCT mode only; tenths when G/M-v2 is set
     hue: int  # 0-360, HSI mode only
     saturation: int  # 0-100, HSI mode only
+    gm_flag: bool = False
 
 
 def decode_status(payload: bytes) -> LightState | None:
@@ -503,9 +764,8 @@ def decode_status(payload: bytes) -> LightState | None:
 
     Fixtures also emit a ``0x0a`` diagnostic page that carries no light state.
     """
-    if len(payload) < 10 or payload[0] != sum(payload[1:10]) & 0xFF:
+    if len(payload) != 10 or payload[0] != sum(payload[1:10]) & 0xFF:
         return None
-
     command = payload[9] & 0x7F  # high bit distinguishes set from report
     low = int.from_bytes(payload[:8], "little")
     high = payload[8] | (payload[9] << 8)
@@ -516,7 +776,19 @@ def decode_status(payload: bytes) -> LightState | None:
         wrapped = (low >> 42) & 0x01
         telink_cct = raw + 1000 if wrapped else raw
         intensity = ((high << 2) | ((low >> 62) & 0x03)) & 0x3FF
-        gm = max(-10, min(10, ((low >> 45) & 0x7F) - 10))
+        gm_flag = bool((low >> 43) & 0x01)
+        gm_value = (low >> 45) & 0x7F
+        gm = (
+            max(
+                -10.0,
+                min(
+                    10.0,
+                    (((low >> 44) & 0x01) * 100 + gm_value - 100) / 10,
+                ),
+            )
+            if gm_flag
+            else max(-10, min(10, gm_value - 10))
+        )
         return LightState(
             on=on,
             is_hsi=False,
@@ -525,6 +797,7 @@ def decode_status(payload: bytes) -> LightState | None:
             gm=gm,
             hue=0,
             saturation=0,
+            gm_flag=gm_flag,
         )
 
     if command == CMD_HSI & 0x7F:
@@ -544,8 +817,21 @@ def decode_status(payload: bytes) -> LightState | None:
     return None
 
 
+def _decode_effect_gm(
+    payload: bytes,
+    gm_flag: bool,
+    high_bit: int,
+    value_bit: int,
+) -> int:
+    """Decode the legacy coarse or G/M-v2 exact raw effect value."""
+    value = _get_bits(payload, value_bit, 7)
+    if not gm_flag:
+        return value * 10
+    return value + 100 * _get_bits(payload, high_bit, 1)
+
+
 def decode_effect(payload: bytes) -> EffectState | None:
-    """Decode an Ace first-generation system-effect command or report."""
+    """Decode a first-generation system-effect command or report."""
     if not _valid_payload(payload, CMD_SYSTEM_EFFECT):
         return None
 
@@ -564,15 +850,34 @@ def decode_effect(payload: bytes) -> EffectState | None:
     speed = 0
     trigger = 0
     kelvin: int | None = None
+    gm: int | None = None
+    gm_flag = False
     variant = 0
+    mode = 0
+    hue: int | None = None
+    saturation: int | None = None
 
-    if selected is SystemEffect.PAPARAZZI:
+    if selected in {SystemEffect.CLUB_LIGHTS, SystemEffect.COP_CAR}:
+        intensity = _get_bits(payload, 54, 10)
+        frequency = _get_bits(payload, 50, 4)
+        variant = _get_bits(payload, 46, 4)
+    elif selected in {SystemEffect.COLOR_CHASE, SystemEffect.PARTY_LIGHTS}:
+        intensity = _get_bits(payload, 54, 10)
+        frequency = _get_bits(payload, 50, 4)
+        saturation = _get_bits(payload, 43, 7)
+    elif selected is SystemEffect.CANDLE:
+        intensity = _get_bits(payload, 54, 10)
+        frequency = _get_bits(payload, 50, 4)
+        variant = _get_bits(payload, 40, 10)
+    elif selected is SystemEffect.PAPARAZZI:
         intensity = _get_bits(payload, 54, 10)
         frequency = _get_bits(payload, 50, 4)
         cct_value = _get_bits(payload, 40, 10)
         if _get_bits(payload, 30, 1):
             cct_value += 1000
         kelvin = cct_value * 10
+        gm_flag = bool(_get_bits(payload, 31, 1))
+        gm = _decode_effect_gm(payload, gm_flag, 32, 33)
     elif selected is SystemEffect.FIREWORKS:
         intensity = _get_bits(payload, 54, 10)
         frequency = _get_bits(payload, 50, 4)
@@ -590,27 +895,66 @@ def decode_effect(payload: bytes) -> EffectState | None:
         if _get_bits(payload, 24, 1):
             cct_value += 1000
         kelvin = cct_value * 10
+        gm_flag = bool(_get_bits(payload, 25, 1))
+        gm = _decode_effect_gm(payload, gm_flag, 26, 33)
+    elif selected is SystemEffect.WELDING:
+        mode = _get_bits(payload, 60, 4)
+        if mode not in {0, 1}:
+            return None
+        intensity = _get_bits(payload, 46, 10)
+        frequency = _get_bits(payload, 56, 4)
+        if mode == 0:
+            speed = _get_bits(payload, 20, 7)
+            trigger = _get_bits(payload, 27, 2)
+            cct_value = _get_bits(payload, 36, 10)
+            if _get_bits(payload, 17, 1):
+                cct_value += 1000
+            kelvin = cct_value * 10
+            gm_flag = bool(_get_bits(payload, 18, 1))
+            gm = _decode_effect_gm(payload, gm_flag, 19, 29)
+        else:
+            speed = _get_bits(payload, 21, 7)
+            trigger = _get_bits(payload, 28, 2)
+            saturation = _get_bits(payload, 30, 7)
+            hue = _get_bits(payload, 37, 9)
     elif selected in {SystemEffect.FAULTY_BULB, SystemEffect.PULSING}:
-        if _get_bits(payload, 60, 4) != 0:
+        mode = _get_bits(payload, 60, 4)
+        if mode not in {0, 1}:
             return None
         intensity = _get_bits(payload, 46, 10)
         frequency = _get_bits(payload, 56, 4)
-        speed = _get_bits(payload, 23, 4)
-        trigger = _get_bits(payload, 27, 2)
-        cct_value = _get_bits(payload, 36, 10)
-        if _get_bits(payload, 20, 1):
-            cct_value += 1000
-        kelvin = cct_value * 10
+        if mode == 1:
+            speed = _get_bits(payload, 24, 4)
+            trigger = _get_bits(payload, 28, 2)
+            saturation = _get_bits(payload, 30, 7)
+            hue = _get_bits(payload, 37, 9)
+        else:
+            speed = _get_bits(payload, 23, 4)
+            trigger = _get_bits(payload, 27, 2)
+            cct_value = _get_bits(payload, 36, 10)
+            if _get_bits(payload, 20, 1):
+                cct_value += 1000
+            kelvin = cct_value * 10
+            gm_flag = bool(_get_bits(payload, 21, 1))
+            gm = _decode_effect_gm(payload, gm_flag, 22, 29)
     else:
-        if _get_bits(payload, 60, 4) != 0:
+        mode = _get_bits(payload, 60, 4)
+        if mode not in {0, 1}:
             return None
         intensity = _get_bits(payload, 46, 10)
         frequency = _get_bits(payload, 56, 4)
-        trigger = _get_bits(payload, 27, 2)
-        cct_value = _get_bits(payload, 36, 10)
-        if _get_bits(payload, 24, 1):
-            cct_value += 1000
-        kelvin = cct_value * 10
+        if mode == 1:
+            trigger = _get_bits(payload, 28, 2)
+            saturation = _get_bits(payload, 30, 7)
+            hue = _get_bits(payload, 37, 9)
+        else:
+            trigger = _get_bits(payload, 27, 2)
+            cct_value = _get_bits(payload, 36, 10)
+            if _get_bits(payload, 24, 1):
+                cct_value += 1000
+            kelvin = cct_value * 10
+            gm_flag = bool(_get_bits(payload, 25, 1))
+            gm = _decode_effect_gm(payload, gm_flag, 26, 29)
 
     return EffectState(
         on=on,
@@ -620,7 +964,12 @@ def decode_effect(payload: bytes) -> EffectState | None:
         speed=speed,
         trigger=trigger,
         kelvin=kelvin,
+        gm=gm,
+        gm_flag=gm_flag,
         variant=variant,
+        mode=mode,
+        hue=hue,
+        saturation=saturation,
     )
 
 
@@ -706,8 +1055,38 @@ def decode_version(payload: bytes) -> VersionState | None:
     )
 
 
+def decode_version2(payload: bytes) -> Version2State | None:
+    """Decode the app's command-37 advanced-capability report."""
+    if not _valid_payload(payload, CMD_VERSION_2):
+        return None
+    return Version2State(
+        system_effects_2_supported=bool(_get_bits(payload, 71, 1)),
+        system_effect_groups=tuple(
+            bool(_get_bits(payload, bit, 1)) for bit in range(70, 62, -1)
+        ),
+        pixel_effects_supported=bool(_get_bits(payload, 62, 1)),
+        pixel_effect_groups=tuple(
+            bool(_get_bits(payload, bit, 1)) for bit in range(61, 54, -1)
+        ),
+        pixel_x1=_get_bits(payload, 51, 4),
+        pixel_y1=_get_bits(payload, 47, 4),
+        pixel_x2=_get_bits(payload, 41, 6),
+        pixel_y2=_get_bits(payload, 35, 6),
+        effect_active=bool(_get_bits(payload, 34, 1)),
+        sleeping=bool(_get_bits(payload, 33, 1)),
+        pixel_num=_get_bits(payload, 29, 4),
+        motion_supported=bool(_get_bits(payload, 28, 1)),
+    )
+
+
 type ProtocolReport = (
-    LightState | EffectState | BoostState | FanState | PowerState | VersionState
+    LightState
+    | EffectState
+    | BoostState
+    | FanState
+    | PowerState
+    | VersionState
+    | Version2State
 )
 
 
@@ -730,4 +1109,6 @@ def decode_report(
         return decode_power(payload, protocol_version=protocol_version)
     if command == CMD_VERSION:
         return decode_version(payload)
+    if command == CMD_VERSION_2:
+        return decode_version2(payload)
     return None

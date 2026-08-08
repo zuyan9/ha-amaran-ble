@@ -49,11 +49,18 @@ async def async_setup_entry(
     entry: AmaranConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up Ace 25x power and version diagnostics."""
+    """Set up runtime-discovered power, version, and fan diagnostics."""
     profile = profile_for_entry(entry)
-    if profile.supports_power or profile.supports_version or profile.supports_fan:
-        entities: list[SensorEntity] = []
-        if profile.supports_power:
+    cataloged = bool(profile.app_product_ids)
+    entities: list[SensorEntity] = []
+    wanted_suffixes: set[str] = set()
+    if (
+        profile.supports_power
+        or profile.supports_version
+        or profile.supports_fan
+        or cataloged
+    ):
+        if profile.supports_power or cataloged:
             entities.extend(
                 [
                     AmaranBatteryEntity(entry),
@@ -61,23 +68,29 @@ async def async_setup_entry(
                     AmaranPowerSourceEntity(entry),
                 ]
             )
-        if profile.supports_version:
+            wanted_suffixes.update({"battery", "remaining_runtime", "power_source"})
+        if profile.supports_version or cataloged:
             entities.append(AmaranProtocolVersionEntity(entry))
+            wanted_suffixes.add("protocol_version")
         if profile.supports_fan:
             entities.extend(
                 [AmaranFanSpeedEntity(entry), AmaranFanTemperatureEntity(entry)]
             )
-        async_add_entities(entities)
-        return
+            wanted_suffixes.update({"fan_speed", "fan_temperature"})
 
     registry = er.async_get(hass)
     address = entry.data[CONF_ADDRESS]
     for suffix in _SENSOR_SUFFIXES:
+        if suffix in wanted_suffixes:
+            continue
         entity_id = registry.async_get_entity_id(
             Platform.SENSOR, DOMAIN, _sensor_unique_id(address, suffix)
         )
         if entity_id is not None:
             registry.async_remove(entity_id)
+
+    if entities:
+        async_add_entities(entities)
 
 
 class _AmaranDiagnosticSensor(SensorEntity):
@@ -94,7 +107,7 @@ class _AmaranDiagnosticSensor(SensorEntity):
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, address)},
             connections={(CONNECTION_BLUETOOTH, address)},
-            manufacturer=MANUFACTURER,
+            manufacturer=self._device.profile.manufacturer or MANUFACTURER,
             name=entry.title,
         )
 
@@ -107,7 +120,7 @@ class _AmaranDiagnosticSensor(SensorEntity):
 
 
 class _AmaranPowerSensor(_AmaranDiagnosticSensor):
-    """Base for values carried by the Ace power status page."""
+    """Base for values carried by the fixture power status page."""
 
     @property
     def available(self) -> bool:
@@ -190,14 +203,36 @@ class AmaranProtocolVersionEntity(_AmaranDiagnosticSensor):
         state = self._device.version_state
         if state is None:
             return None
-        return {
+        attributes: dict[str, Any] = {
             "control_hardware_version": state.control_hw_version,
             "control_software_version": state.control_sw_version,
             "driver_hardware_version": state.driver_hw_version,
             "driver_software_version": state.driver_sw_version,
             "minimum_color_temperature": state.cct_min_kelvin,
             "maximum_color_temperature": state.cct_max_kelvin,
+            "manual_effects_supported": state.manual_fx_supported,
+            "program_effects_supported": state.program_fx_supported,
+            "picker_effects_supported": state.picker_fx_supported,
+            "touchbar_effects_supported": state.touchbar_fx_supported,
+            "music_effects_supported": state.music_fx_supported,
         }
+        advanced = self._device.version2_state
+        if advanced is not None:
+            attributes.update(
+                {
+                    "system_effects_2_supported": advanced.system_effects_2_supported,
+                    "system_effect_groups": list(advanced.active_system_effect_groups),
+                    "pixel_effects_supported": advanced.pixel_effects_supported,
+                    "pixel_effect_groups": list(advanced.active_pixel_effect_groups),
+                    "pixel_geometry": [
+                        [advanced.pixel_x1, advanced.pixel_y1],
+                        [advanced.pixel_x2, advanced.pixel_y2],
+                    ],
+                    "pixel_num": advanced.pixel_num,
+                    "motion_supported": advanced.motion_supported,
+                }
+            )
+        return attributes
 
 
 class _AmaranFanSensor(_AmaranDiagnosticSensor):

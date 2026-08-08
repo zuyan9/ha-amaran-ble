@@ -82,7 +82,7 @@ class AmaranFanModeEntity(SelectEntity):
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, address)},
             connections={(CONNECTION_BLUETOOTH, address)},
-            manufacturer=MANUFACTURER,
+            manufacturer=self._device.profile.manufacturer or MANUFACTURER,
             name=entry.title,
         )
 
@@ -133,7 +133,7 @@ class AmaranEffectRateEntity(SelectEntity):
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, address)},
             connections={(CONNECTION_BLUETOOTH, address)},
-            manufacturer=MANUFACTURER,
+            manufacturer=self._device.profile.manufacturer or MANUFACTURER,
             name=entry.title,
         )
 
@@ -153,8 +153,12 @@ class AmaranEffectRateEntity(SelectEntity):
         state = self._device.effect_state
         options = [str(value) for value in range(1, 11)]
         if state is None or state.effect not in {
+            SystemEffect.CLUB_LIGHTS,
+            SystemEffect.CANDLE,
             SystemEffect.FIRE,
             SystemEffect.EXPLOSION,
+            SystemEffect.COLOR_CHASE,
+            SystemEffect.PARTY_LIGHTS,
         }:
             options.append("random")
         return options
@@ -162,9 +166,10 @@ class AmaranEffectRateEntity(SelectEntity):
     @property
     def current_option(self) -> str | None:
         state = self._device.effect_state
-        if state is None:
+        frequency = None if state is None else getattr(state, "frequency", None)
+        if frequency is None:
             return None
-        option = "random" if state.frequency == 11 else str(state.frequency)
+        option = "random" if frequency == 11 else str(frequency)
         return option if option in self.options else None
 
     async def async_select_option(self, option: str) -> None:
@@ -176,7 +181,7 @@ class AmaranEffectRateEntity(SelectEntity):
 
 
 class AmaranEffectColorEntity(SelectEntity):
-    """App-defined white presets for TV, Fire, and Fireworks."""
+    """App-defined preset or colour choice for the active effect."""
 
     _attr_has_entity_name = True
     _attr_translation_key = "effect_color"
@@ -190,7 +195,7 @@ class AmaranEffectColorEntity(SelectEntity):
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, address)},
             connections={(CONNECTION_BLUETOOTH, address)},
-            manufacturer=MANUFACTURER,
+            manufacturer=self._device.profile.manufacturer or MANUFACTURER,
             name=entry.title,
         )
 
@@ -213,9 +218,10 @@ class AmaranEffectColorEntity(SelectEntity):
     def current_option(self) -> str | None:
         state = self._device.effect_state
         options = self.options
-        if state is None or not 0 <= state.variant < len(options):
+        variant = None if state is None else getattr(state, "variant", None)
+        if variant is None or not 0 <= variant < len(options):
             return None
-        return options[state.variant]
+        return options[variant]
 
     async def async_select_option(self, option: str) -> None:
         try:

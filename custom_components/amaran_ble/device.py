@@ -13,7 +13,7 @@ import contextlib
 import logging
 import math
 from collections.abc import Awaitable, Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from bleak import BleakClient
 from bleak.exc import BleakError
@@ -22,7 +22,7 @@ from homeassistant.components import bluetooth
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.storage import Store
 
-from .amaranble import network, telink
+from .amaranble import highspeed, network, pixelfx, systemfx2, telink
 from .amaranble.config_client import ConfigClient
 from .amaranble.gatt import MESH_PROVISIONING_SERVICE, MESH_PROXY_SERVICE
 from .amaranble.proxy import AccessMessage, ProxyClient, ProxyError
@@ -43,6 +43,211 @@ DISCONNECT_TIMEOUT = 5.0
 MAX_MISSED_POLLS = 3
 OPTIONAL_REPORT_TIMEOUT = 0.8
 FAN_APPLY_SETTLE = 0.2
+
+
+@dataclass(frozen=True, slots=True)
+class PixelRuntimeState:
+    """Merged command-33 pages for one active pixel effect.
+
+    Pixel effects are reported as one control page plus one or more colour
+    pages.  Home Assistant needs a single primary light state, so the runtime
+    retains the latest page of each kind while still exposing the effect's
+    playback and global intensity as one object.
+    """
+
+    effect: pixelfx.PixelEffect
+    playback: pixelfx.PixelPlayback
+    intensity: int | None
+    pages: tuple[pixelfx.PixelEffectState, ...]
+
+    @property
+    def on(self) -> bool | None:
+        """Return the proven pixel power state, or unknown for CONTINUE pages."""
+        if self.playback is pixelfx.PixelPlayback.CONTINUE:
+            # The app treats CONTINUE as non-sleep, but it is emitted by colour
+            # pages specifically to preserve the existing playback state. A
+            # lone continuation report therefore cannot prove on versus off.
+            return None
+        return self.playback is not pixelfx.PixelPlayback.STOP
+
+
+def _pixel_page_key(state: pixelfx.PixelEffectState) -> tuple[int, int]:
+    """Return a stable key/order for one command-33 report page."""
+    if state.effect is pixelfx.PixelEffect.RAINBOW:
+        return (2, 0)
+    if state.packet_type is pixelfx.PixelPacketType.COLOR:
+        return (0, state.serial or 0)
+    if state.packet_type is pixelfx.PixelPacketType.BASE:
+        return (1, 0)
+    return (2, 0)
+
+
+def _merge_pixel_page(
+    current: PixelRuntimeState | None,
+    report: pixelfx.PixelEffectState,
+) -> PixelRuntimeState:
+    """Merge a command-33 page without discarding other reported settings."""
+    pages = (
+        {_pixel_page_key(page): page for page in current.pages}
+        if current is not None and current.effect is report.effect
+        else {}
+    )
+    pages[_pixel_page_key(report)] = report
+    ordered = tuple(page for _, page in sorted(pages.items()))
+    control = next(
+        (
+            page
+            for page in ordered
+            if page.effect is pixelfx.PixelEffect.RAINBOW
+            or page.packet_type is pixelfx.PixelPacketType.CONTROL
+        ),
+        None,
+    )
+    playback = (
+        control.playback
+        if control is not None
+        else (
+            current.playback
+            if current is not None and current.effect is report.effect
+            else report.playback
+        )
+    )
+    intensity = next(
+        (
+            page.brightness
+            for page in ordered
+            if page.brightness is not None
+            and (
+                page.effect is not pixelfx.PixelEffect.PIXEL_FIRE
+                or page.packet_type is pixelfx.PixelPacketType.BASE
+            )
+        ),
+        None,
+    )
+    return PixelRuntimeState(report.effect, playback, intensity, ordered)
+
+
+def _decode_pixel_sequence(payloads: tuple[bytes, ...]) -> PixelRuntimeState:
+    """Decode the app's complete multi-page pixel-effect sequence."""
+    state: PixelRuntimeState | None = None
+    for payload in payloads:
+        report = pixelfx.decode(payload)
+        assert report is not None
+        state = _merge_pixel_page(state, report)
+    assert state is not None
+    return state
+
+
+def _pixel_pages_complete(state: PixelRuntimeState) -> bool:
+    """Return whether every page required by the reported program is cached."""
+    keys = {_pixel_page_key(page) for page in state.pages}
+    if state.effect is pixelfx.PixelEffect.RAINBOW:
+        return keys == {(2, 0)}
+    if (2, 0) not in keys:
+        return False
+    if state.effect in {
+        pixelfx.PixelEffect.COLOR_FADE,
+        pixelfx.PixelEffect.COLOR_CYCLE,
+    }:
+        control = next(
+            page
+            for page in state.pages
+            if page.packet_type is pixelfx.PixelPacketType.CONTROL
+        )
+        return (
+            control.color_count is not None
+            and control.color_count >= 2
+            and all((0, serial) in keys for serial in range(control.color_count))
+        )
+    if state.effect is pixelfx.PixelEffect.PIXEL_FIRE:
+        return {(0, 0), (1, 0), (2, 0)} <= keys
+    control = next(
+        page
+        for page in state.pages
+        if page.packet_type is pixelfx.PixelPacketType.CONTROL
+    )
+    if control.group not in {0, 1}:
+        return False
+    single_group_pages = {
+        pixelfx.PixelEffect.ONE_PIXEL_CHASE: 2,
+        pixelfx.PixelEffect.TWO_PIXEL_CHASE: 3,
+        pixelfx.PixelEffect.THREE_PIXEL_CHASE: 4,
+    }[state.effect]
+    color_pages = (
+        single_group_pages if control.group == 0 else (single_group_pages * 2) - 1
+    )
+    return all((0, serial) in keys for serial in range(color_pages))
+
+
+def _pixel_payloads(
+    current: PixelRuntimeState,
+    *,
+    intensity: int | None,
+    on: bool,
+) -> tuple[bytes, ...]:
+    """Rebuild a complete pixel program while preserving its page settings."""
+    # A reconnect may yield only the control report. Fall back to the app's
+    # proven defaults rather than inventing missing colour pages.
+    defaults = _decode_pixel_sequence(pixelfx.effect(current.effect, on=on))
+    source = current if _pixel_pages_complete(current) else defaults
+    playback = pixelfx.PixelPlayback.RUNNING if on else pixelfx.PixelPlayback.STOP
+    payloads: list[bytes] = []
+    source_pages = source.pages
+    if source.effect in {
+        pixelfx.PixelEffect.COLOR_FADE,
+        pixelfx.PixelEffect.COLOR_CYCLE,
+    }:
+        control = next(
+            page
+            for page in source.pages
+            if page.packet_type is pixelfx.PixelPacketType.CONTROL
+        )
+        assert control.color_count is not None
+        source_pages = tuple(
+            page
+            for page in source.pages
+            if page.packet_type is not pixelfx.PixelPacketType.COLOR
+            or (page.serial is not None and page.serial < control.color_count)
+        )
+    elif source.effect in {
+        pixelfx.PixelEffect.ONE_PIXEL_CHASE,
+        pixelfx.PixelEffect.TWO_PIXEL_CHASE,
+        pixelfx.PixelEffect.THREE_PIXEL_CHASE,
+    }:
+        control = next(
+            page
+            for page in source.pages
+            if page.packet_type is pixelfx.PixelPacketType.CONTROL
+        )
+        assert control.group in {0, 1}
+        single_group_pages = {
+            pixelfx.PixelEffect.ONE_PIXEL_CHASE: 2,
+            pixelfx.PixelEffect.TWO_PIXEL_CHASE: 3,
+            pixelfx.PixelEffect.THREE_PIXEL_CHASE: 4,
+        }[source.effect]
+        color_count = (
+            single_group_pages if control.group == 0 else (single_group_pages * 2) - 1
+        )
+        source_pages = tuple(
+            page
+            for page in source.pages
+            if page.packet_type is not pixelfx.PixelPacketType.COLOR
+            or (page.serial is not None and page.serial < color_count)
+        )
+    for page in source_pages:
+        final_page = (
+            page.effect is pixelfx.PixelEffect.RAINBOW
+            or page.packet_type is pixelfx.PixelPacketType.CONTROL
+        )
+        updated = replace(
+            page,
+            playback=(playback if final_page else pixelfx.PixelPlayback.CONTINUE),
+            brightness=(page.brightness if intensity is None else intensity)
+            if page.brightness is not None
+            else None,
+        )
+        payloads.append(pixelfx.encode(updated))
+    return tuple(payloads)
 
 
 def _sequence_store(hass: HomeAssistant, sequence_store_id: str) -> Store[dict]:
@@ -210,10 +415,16 @@ class AmaranLight:
         # look instead of inventing a new one.
         self._state: telink.LightState | None = None
         self._effect_state: telink.EffectState | None = None
+        self._effect2_state: systemfx2.SystemEffect2State | None = None
+        self._pixel_state: PixelRuntimeState | None = None
+        self._pixel_report_generation = 0
+        self._pixel_page_generations: dict[tuple[int, int], int] = {}
         self._boost_state: telink.BoostState | None = None
         self._fan_state: telink.FanState | None = None
         self._power_state: telink.PowerState | None = None
         self._version_state: telink.VersionState | None = None
+        self._version2_state: telink.Version2State | None = None
+        self._high_speed_state: highspeed.HighSpeedMessage | None = None
         # HSI reports do not carry G/M, so retain the last CCT tint instead of
         # treating every switch to colour mode as a reset to neutral.
         self._preferred_gm = 0
@@ -222,6 +433,8 @@ class AmaranLight:
         self._fan_received = asyncio.Event()
         self._power_received = asyncio.Event()
         self._version_received = asyncio.Event()
+        self._version2_received = asyncio.Event()
+        self._high_speed_received = asyncio.Event()
         self._listeners: list[Callable[[], None]] = []
 
     # ─── Public surface ──────────────────────────────────────────────────────
@@ -231,8 +444,21 @@ class AmaranLight:
         return self._state
 
     @property
-    def effect_state(self) -> telink.EffectState | None:
-        return self._effect_state
+    def effect_state(
+        self,
+    ) -> telink.EffectState | systemfx2.SystemEffect2State | PixelRuntimeState | None:
+        """Return the active built-in effect regardless of protocol generation."""
+        return self._effect_state or self._effect2_state or self._pixel_state
+
+    @property
+    def effect2_state(self) -> systemfx2.SystemEffect2State | None:
+        """Return the active command-34 effect state, if any."""
+        return self._effect2_state
+
+    @property
+    def pixel_state(self) -> PixelRuntimeState | None:
+        """Return the merged command-33 pixel-effect state, if active."""
+        return self._pixel_state
 
     @property
     def boost_state(self) -> telink.BoostState | None:
@@ -251,14 +477,39 @@ class AmaranLight:
         return self._version_state
 
     @property
-    def preferred_gm(self) -> int:
+    def version2_state(self) -> telink.Version2State | None:
+        """Return runtime-discovered advanced effect and pixel capabilities."""
+        return self._version2_state
+
+    @property
+    def high_speed_state(self) -> highspeed.HighSpeedMessage | None:
+        """Return the last commanded or reported high-speed-photo state."""
+        return self._high_speed_state
+
+    @property
+    def preferred_gm(self) -> float:
         """Return the last known or requested green/magenta adjustment."""
         return self._preferred_gm
 
     @property
+    def green_magenta_min(self) -> int:
+        """Return the cataloged minimum normalized G/M value."""
+        color = self.profile.catalog_capabilities.steady_color
+        return color.gm_min - 10 if color.gm else -10
+
+    @property
+    def green_magenta_max(self) -> int:
+        """Return the cataloged maximum normalized G/M value."""
+        color = self.profile.catalog_capabilities.steady_color
+        return color.gm_max - 10 if color.gm else 10
+
+    @property
     def available(self) -> bool:
         return self._proxy is not None and (
-            self._state is not None or self._effect_state is not None
+            self._state is not None
+            or self._effect_state is not None
+            or self._effect2_state is not None
+            or self._pixel_state is not None
         )
 
     @property
@@ -278,7 +529,11 @@ class AmaranLight:
     @property
     def effect_frequency_available(self) -> bool:
         """Whether the active built-in effect has a rate parameter."""
-        return self._effect_state is not None and self._effect_state.on
+        return (self._effect_state is not None and self._effect_state.on) or (
+            self._effect2_state is not None
+            and self._effect2_state.on
+            and self._effect2_state.frequency is not None
+        )
 
     @property
     def effect_color_temperature_available(self) -> bool:
@@ -287,6 +542,52 @@ class AmaranLight:
             self._effect_state is not None
             and self._effect_state.on
             and self._effect_state.kelvin is not None
+        ) or (
+            self._effect2_state is not None
+            and self._effect2_state.on
+            and self._effect2_state.kelvin is not None
+        )
+
+    @property
+    def effect_hue_available(self) -> bool:
+        """Whether the active effect carries an adjustable HSI hue."""
+        return (
+            self._effect_state is not None
+            and self._effect_state.on
+            and self._effect_state.hue is not None
+        ) or (
+            self._effect2_state is not None
+            and self._effect2_state.on
+            and self._effect2_state.hue is not None
+        )
+
+    @property
+    def effect_saturation_available(self) -> bool:
+        """Whether the active effect carries adjustable saturation."""
+        return (
+            self._effect_state is not None
+            and self._effect_state.on
+            and self._effect_state.saturation is not None
+        ) or (
+            self._effect2_state is not None
+            and self._effect2_state.on
+            and self._effect2_state.saturation is not None
+        )
+
+    @property
+    def effect_gm_available(self) -> bool:
+        """Whether the active effect carries an adjustable G/M field."""
+        return self.profile.supports_gm and (
+            (
+                self._effect_state is not None
+                and self._effect_state.on
+                and self._effect_state.gm is not None
+            )
+            or (
+                self._effect2_state is not None
+                and self._effect2_state.on
+                and self._effect2_state.gm is not None
+            )
         )
 
     @property
@@ -295,10 +596,24 @@ class AmaranLight:
         state = self._effect_state
         if state is None or not state.on:
             return ()
-        if state.effect in {telink.SystemEffect.TV, telink.SystemEffect.FIRE}:
+        if state.effect in {
+            telink.SystemEffect.TV,
+            telink.SystemEffect.CANDLE,
+            telink.SystemEffect.FIRE,
+        }:
             return ("warmer", "natural", "cooler")
         if state.effect is telink.SystemEffect.FIREWORKS:
             return ("warmer", "cooler", "multi")
+        if state.effect is telink.SystemEffect.CLUB_LIGHTS:
+            return ("3", "6", "9", "12", "15", "18", "24", "36")
+        if state.effect is telink.SystemEffect.COP_CAR:
+            return (
+                "red",
+                "blue",
+                "red_blue",
+                "blue_white",
+                "red_blue_white",
+            )
         return ()
 
     @callback
@@ -374,12 +689,44 @@ class AmaranLight:
         await self._async_send(telink.brightness(intensity))
 
     async def async_set_cct(self, kelvin: int, intensity: int, gm: float = 0) -> None:
-        await self._async_send(telink.cct(kelvin, intensity, gm))
+        await self._async_send(
+            telink.cct(
+                kelvin,
+                intensity,
+                gm,
+                gm_flag=bool(
+                    self.profile.catalog_capabilities.steady_color.gm_v2_version
+                ),
+            )
+        )
 
     async def async_set_hsi(
         self, hue: float, saturation: float, intensity: int
     ) -> None:
         await self._async_send(telink.hsi(hue, saturation, intensity))
+
+    async def async_set_high_speed(self, enabled: bool) -> None:
+        """Set the cataloged high-speed-photography mode.
+
+        The app artifact exposes command 53 as a one-bit state write but does
+        not contain a separate read request. Keep the successfully transmitted
+        state locally, as the app does for its similarly modal Boost command;
+        a later fixture report can still replace it.
+        """
+        capability = self.profile.catalog_capabilities.high_speed_photography
+        if not capability.supported:
+            raise AmaranConnectionError(
+                f"high-speed photography is not enabled for {self.name}"
+            )
+        payload = highspeed.build_high_speed(enabled)
+        async with self._operation_lock:
+            await self._async_send(payload)
+            state = highspeed.decode_high_speed(payload)
+            assert state is not None
+            changed = state != self._high_speed_state
+            self._high_speed_state = state
+            if changed:
+                self._notify_listeners()
 
     def _effect_payload(
         self,
@@ -389,13 +736,17 @@ class AmaranLight:
         frequency: float | None = None,
         kelvin: float | None = None,
         variant: float | None = None,
+        hue: float | None = None,
+        saturation: float | None = None,
+        gm: float | None = None,
+        gm_flag: int | bool | None = None,
     ) -> bytes:
         """Rebuild the active effect's complete state packet."""
         return telink.effect(
             state.effect,
             intensity=state.intensity if intensity is None else intensity,
             frequency=state.frequency if frequency is None else frequency,
-            speed=state.speed or 5,
+            speed=state.speed or None,
             trigger=state.trigger,
             kelvin=(
                 state.kelvin or self._default_effect_kelvin()
@@ -403,7 +754,99 @@ class AmaranLight:
                 else kelvin
             ),
             variant=state.variant if variant is None else variant,
+            mode=state.mode,
+            hue=(state.hue or 0) if hue is None else hue,
+            saturation=state.saturation if saturation is None else saturation,
+            gm=(state.gm if state.gm is not None else 100) if gm is None else gm,
+            gm_flag=state.gm_flag if gm_flag is None else gm_flag,
         )
+
+    def _effect2_payloads(
+        self,
+        state: systemfx2.SystemEffect2State,
+        *,
+        on: bool | None = None,
+        intensity: int | None = None,
+        frequency: int | None = None,
+        kelvin: int | None = None,
+        gm: int | None = None,
+        hue: int | None = None,
+        saturation: int | None = None,
+    ) -> tuple[bytes, ...]:
+        """Rebuild a command-34 effect without discarding reported fields."""
+        return systemfx2.effect2(
+            state.effect,
+            on=state.on if on is None else on,
+            intensity=state.intensity if intensity is None else intensity,
+            frequency=state.frequency if frequency is None else frequency,
+            speed=state.speed,
+            mode=state.mode,
+            kelvin=state.kelvin if kelvin is None else kelvin,
+            gm=state.gm if gm is None else gm,
+            hue=state.hue if hue is None else hue,
+            saturation=(state.saturation if saturation is None else saturation),
+            center_kelvin=state.center_kelvin,
+            min_kelvin=state.min_kelvin,
+            max_kelvin=state.max_kelvin,
+            min_hue=state.min_hue,
+            max_hue=state.max_hue,
+            min_intensity=state.min_intensity,
+            gap_time=state.gap_time,
+            min_gap_time=state.min_gap_time,
+            decay=state.decay,
+            color=state.color,
+            gel_kelvin=state.gel_kelvin,
+            gel_origin=state.gel_origin,
+            gel_type=state.gel_type,
+            variant=state.variant,
+        )
+
+    @staticmethod
+    def _decode_effect2_sequence(
+        payloads: tuple[bytes, ...],
+    ) -> systemfx2.SystemEffect2State:
+        """Decode and merge a complete command-34 packet sequence."""
+        state: systemfx2.SystemEffect2State | None = None
+        for payload in payloads:
+            decoded = systemfx2.decode_effect2(payload)
+            assert decoded is not None
+            state = systemfx2.merge_effect2_states(state, decoded)
+        assert state is not None
+        return state
+
+    async def _async_update_effect2_unlocked(
+        self,
+        *,
+        error_label: str,
+        frequency: int | None = None,
+        kelvin: int | None = None,
+        gm: int | None = None,
+        hue: int | None = None,
+        saturation: int | None = None,
+    ) -> None:
+        """Rewrite and confirm a complete command-34 effect state."""
+        state = self._effect2_state
+        if state is None or not state.on:
+            raise AmaranConnectionError(
+                f"{self.name} is not running an active generation-II effect"
+            )
+        payloads = self._effect2_payloads(
+            state,
+            frequency=frequency,
+            kelvin=kelvin,
+            gm=gm,
+            hue=hue,
+            saturation=saturation,
+        )
+        expected = self._decode_effect2_sequence(payloads)
+        for payload in payloads:
+            await self._async_send(payload)
+        if not await self._async_confirm_primary_state(
+            lambda: self._effect2_state == expected
+        ):
+            raise AmaranConnectionError(
+                f"{self.name} did not confirm its effect {error_label}"
+            )
 
     def _default_effect_kelvin(self) -> int:
         """Choose an in-range CCT for effects that carry a white point."""
@@ -415,18 +858,53 @@ class AmaranLight:
         return (self.profile.min_kelvin + self.profile.max_kelvin) // 2
 
     async def async_apply_effect(
-        self, effect: telink.SystemEffect | str, *, intensity: int | None = None
+        self,
+        effect: telink.SystemEffect
+        | systemfx2.SystemEffect2
+        | pixelfx.PixelEffect
+        | str,
+        *,
+        intensity: int | None = None,
     ) -> None:
         """Select a built-in effect as part of a Home Assistant turn-on."""
         if not self.profile.supports_effects:
             raise AmaranConnectionError(f"effects are not enabled for {self.name}")
         try:
             selected = telink.SystemEffect(effect)
-        except ValueError as err:
-            raise AmaranConnectionError(
-                f"{effect!r} is not a supported effect for {self.name}"
-            ) from err
-        if selected.value not in self.profile.effects:
+        except ValueError:
+            try:
+                selected2 = systemfx2.SystemEffect2(effect)
+            except ValueError:
+                try:
+                    selected_pixel = pixelfx.PixelEffect(effect)
+                except ValueError as err:
+                    raise AmaranConnectionError(
+                        f"{effect!r} is not a supported effect for {self.name}"
+                    ) from err
+                if selected_pixel.value not in self.profile.pixel_effects:
+                    raise AmaranConnectionError(
+                        f"{selected_pixel.value!r} is not a supported effect for "
+                        f"{self.name}"
+                    ) from None
+                async with self._operation_lock:
+                    await self._async_apply_pixel_effect_unlocked(
+                        selected_pixel, intensity=intensity
+                    )
+                return
+            else:
+                if selected2.value not in self.profile.system_effects2:
+                    raise AmaranConnectionError(
+                        f"{selected2.value!r} is not a supported effect for {self.name}"
+                    ) from None
+                async with self._operation_lock:
+                    await self._async_apply_effect2_unlocked(
+                        selected2, intensity=intensity
+                    )
+                return
+        if selected.value not in self.profile.effects and not (
+            selected is telink.SystemEffect.OFF
+            and selected.value in self.profile.all_effects
+        ):
             raise AmaranConnectionError(
                 f"{selected.value!r} is not a supported effect for {self.name}"
             )
@@ -436,11 +914,12 @@ class AmaranLight:
                 return
 
             current = self._effect_state
+            active = self.effect_state
             if self._boost_state is not None and self._boost_state.enabled:
                 await self._async_set_boost_unlocked(False)
             output_was_on = (
-                current.on
-                if current is not None
+                active.on
+                if active is not None
                 else self._state is not None and self._state.on
             )
             preserving_active_effect = (
@@ -456,8 +935,10 @@ class AmaranLight:
                     intensity
                     if intensity is not None
                     else (
-                        current.intensity
-                        if current is not None and current.intensity > 0
+                        active.intensity
+                        if active is not None
+                        and active.intensity is not None
+                        and active.intensity > 0
                         else (
                             self._state.intensity
                             if self._state is not None and self._state.intensity > 0
@@ -469,8 +950,33 @@ class AmaranLight:
                     selected,
                     intensity=expected_intensity,
                     frequency=5,
-                    speed=5,
                     kelvin=self._default_effect_kelvin(),
+                    mode=(
+                        1
+                        if self.profile.supports_color
+                        and selected
+                        in {
+                            telink.SystemEffect.FAULTY_BULB,
+                            telink.SystemEffect.PULSING,
+                            telink.SystemEffect.STROBE,
+                            telink.SystemEffect.EXPLOSION,
+                            telink.SystemEffect.WELDING,
+                        }
+                        else 0
+                    ),
+                    hue=(
+                        self._state.hue
+                        if self._state is not None and self._state.is_hsi
+                        else 0
+                    ),
+                    saturation=(
+                        self._state.saturation
+                        if self._state is not None and self._state.is_hsi
+                        else 100
+                    ),
+                    gm_flag=bool(
+                        self.profile.catalog_capabilities.steady_color.gm_v2_version
+                    ),
                 )
             expected_effect = telink.decode_effect(payload)
             assert expected_effect is not None
@@ -502,9 +1008,178 @@ class AmaranLight:
                     f"{self.name} did not confirm effect {selected.value}"
                 )
 
+    async def _async_apply_pixel_effect_unlocked(
+        self,
+        selected: pixelfx.PixelEffect,
+        *,
+        intensity: int | None,
+    ) -> None:
+        """Select a defaults-proven command-33 pixel program."""
+        current = self._pixel_state
+        active = self.effect_state
+        if self._boost_state is not None and self._boost_state.enabled:
+            await self._async_set_boost_unlocked(False)
+        output_was_on = (
+            active.on
+            if active is not None
+            else self._state is not None and self._state.on
+        )
+        expected_intensity = (
+            intensity
+            if intensity is not None
+            else (
+                active.intensity
+                if active is not None
+                and active.intensity is not None
+                and active.intensity > 0
+                else (
+                    self._state.intensity
+                    if self._state is not None and self._state.intensity > 0
+                    else 180
+                )
+            )
+        )
+        if current is not None and current.effect is selected:
+            payloads = _pixel_payloads(
+                current,
+                intensity=expected_intensity,
+                on=True,
+            )
+        else:
+            defaults = _decode_pixel_sequence(pixelfx.effect(selected))
+            payloads = _pixel_payloads(
+                defaults,
+                intensity=expected_intensity,
+                on=True,
+            )
+        expected = _decode_pixel_sequence(payloads)
+        report_generation = self._pixel_report_generation
+        for payload in payloads:
+            await self._async_send(payload)
+        if not output_was_on:
+            await self.async_turn_on()
+
+        if not await self._async_confirm_primary_state(
+            lambda: (
+                self._pixel_state is not None
+                and self._pixel_state.on
+                and self._pixel_state.effect is selected
+                and self._pixel_page_generations.get((2, 0), 0) > report_generation
+                and (
+                    selected is not pixelfx.PixelEffect.RAINBOW
+                    or self._pixel_state.intensity == expected_intensity
+                )
+            )
+        ):
+            raise AmaranConnectionError(
+                f"{self.name} did not confirm pixel effect {selected.value}"
+            )
+
+        # A status query commonly returns only the control page. The control
+        # report confirms the preceding app-defined sequence, so retain the
+        # exact colour pages we sent while preferring any fields the fixture
+        # actually reported.
+        reported = self._pixel_state
+        merged = expected
+        if reported is not None:
+            for page in reported.pages:
+                if (
+                    self._pixel_page_generations.get(_pixel_page_key(page), 0)
+                    > report_generation
+                ):
+                    merged = _merge_pixel_page(merged, page)
+        if merged != self._pixel_state:
+            self._pixel_state = merged
+            self._notify_listeners()
+
+    async def _async_apply_effect2_unlocked(
+        self,
+        selected: systemfx2.SystemEffect2,
+        *,
+        intensity: int | None,
+    ) -> None:
+        """Select a default-safe command-34 effect with the operation lock held."""
+        current = self._effect2_state
+        active = self.effect_state
+        if self._boost_state is not None and self._boost_state.enabled:
+            await self._async_set_boost_unlocked(False)
+        output_was_on = (
+            active.on
+            if active is not None
+            else self._state is not None and self._state.on
+        )
+        expected_intensity = (
+            intensity
+            if intensity is not None
+            else (
+                active.intensity
+                if active is not None
+                and active.intensity is not None
+                and active.intensity > 0
+                else (
+                    self._state.intensity
+                    if self._state is not None and self._state.intensity > 0
+                    else 180
+                )
+            )
+        )
+        if current is not None and current.effect is selected:
+            payloads = self._effect2_payloads(
+                current,
+                on=True,
+                intensity=expected_intensity,
+            )
+            expected = self._decode_effect2_sequence(payloads)
+            preserving_active_effect = True
+        else:
+            mode = 1 if self.profile.supports_color else 0
+            kelvin = self._default_effect_kelvin()
+            payloads = systemfx2.effect2(
+                selected,
+                intensity=expected_intensity,
+                mode=mode,
+                kelvin=kelvin,
+                gm=(self._preferred_gm + 10) * 10,
+                hue=(
+                    self._state.hue
+                    if self._state is not None and self._state.is_hsi
+                    else 1
+                ),
+                saturation=(
+                    self._state.saturation
+                    if self._state is not None and self._state.is_hsi
+                    else 100
+                ),
+                center_kelvin=kelvin,
+                min_kelvin=self.profile.min_kelvin,
+                max_kelvin=self.profile.max_kelvin,
+            )
+            expected = self._decode_effect2_sequence(payloads)
+            preserving_active_effect = False
+        for payload in payloads:
+            await self._async_send(payload)
+        if not output_was_on:
+            await self.async_turn_on()
+
+        def effect_matches() -> bool:
+            report = self._effect2_state
+            if preserving_active_effect:
+                return report == expected
+            return (
+                report is not None
+                and report.on
+                and report.effect is selected
+                and report.intensity == expected_intensity
+            )
+
+        if not await self._async_confirm_primary_state(effect_matches):
+            raise AmaranConnectionError(
+                f"{self.name} did not confirm effect {selected.value}"
+            )
+
     async def _async_exit_effect(self, *, intensity: int | None = None) -> None:
         """Leave system-FX mode and restore the last steady light look."""
-        current = self._effect_state
+        current = self.effect_state
         steady = self._state
         if steady is not None:
             target_intensity = steady.intensity if intensity is None else intensity
@@ -535,6 +1210,8 @@ class AmaranLight:
         if not await self._async_confirm_primary_state(
             lambda: (
                 self._effect_state is None
+                and self._effect2_state is None
+                and self._pixel_state is None
                 and self._state is not None
                 and self._state.on
                 and (intensity is None or self._state.intensity == intensity)
@@ -547,6 +1224,17 @@ class AmaranLight:
     async def async_set_effect_frequency(self, frequency: float) -> None:
         """Set the active effect rate, including the APK's value 11=Random."""
         async with self._operation_lock:
+            state2 = self._effect2_state
+            if state2 is not None:
+                if not state2.on or state2.frequency is None:
+                    raise AmaranConnectionError(
+                        f"{self.name} is not running a rate-adjustable effect"
+                    )
+                target = max(1, min(11, math.floor(frequency + 0.5)))
+                await self._async_update_effect2_unlocked(
+                    error_label="rate", frequency=target
+                )
+                return
             state = self._effect_state
             if state is None or not state.on:
                 raise AmaranConnectionError(
@@ -555,7 +1243,14 @@ class AmaranLight:
             maximum = (
                 10
                 if state.effect
-                in {telink.SystemEffect.FIRE, telink.SystemEffect.EXPLOSION}
+                in {
+                    telink.SystemEffect.CLUB_LIGHTS,
+                    telink.SystemEffect.CANDLE,
+                    telink.SystemEffect.FIRE,
+                    telink.SystemEffect.EXPLOSION,
+                    telink.SystemEffect.COLOR_CHASE,
+                    telink.SystemEffect.PARTY_LIGHTS,
+                }
                 else 11
             )
             target = max(1, min(maximum, math.floor(frequency + 0.5)))
@@ -573,6 +1268,22 @@ class AmaranLight:
     async def async_set_effect_kelvin(self, kelvin: float) -> None:
         """Set the CCT field of an active Ace effect in the app's 50 K steps."""
         async with self._operation_lock:
+            state2 = self._effect2_state
+            if state2 is not None:
+                if not state2.on or state2.kelvin is None:
+                    raise AmaranConnectionError(
+                        f"{self.name} is not running an active CCT-adjustable effect"
+                    )
+                target = self.profile.min_kelvin + 50 * math.floor(
+                    (kelvin - self.profile.min_kelvin) / 50 + 0.5
+                )
+                target = min(
+                    max(target, self.profile.min_kelvin), self.profile.max_kelvin
+                )
+                await self._async_update_effect2_unlocked(
+                    error_label="colour temperature", kelvin=target
+                )
+                return
             state = self._effect_state
             if state is None or not state.on or state.kelvin is None:
                 raise AmaranConnectionError(
@@ -593,8 +1304,117 @@ class AmaranLight:
                     f"{self.name} did not confirm its effect colour temperature"
                 )
 
+    async def async_set_effect_hue(self, hue: float) -> None:
+        """Set the HSI hue carried by an active system effect."""
+        async with self._operation_lock:
+            state2 = self._effect2_state
+            if state2 is not None:
+                if not state2.on or state2.hue is None:
+                    raise AmaranConnectionError(
+                        f"{self.name} is not running an HSI-adjustable effect"
+                    )
+                target = max(0, min(360, math.floor(hue + 0.5)))
+                await self._async_update_effect2_unlocked(error_label="hue", hue=target)
+                return
+            state = self._effect_state
+            if state is None or not state.on or state.hue is None:
+                raise AmaranConnectionError(
+                    f"{self.name} is not running an HSI-adjustable effect"
+                )
+            target = max(0, min(360, math.floor(hue + 0.5)))
+            payload = self._effect_payload(state, hue=target)
+            expected = telink.decode_effect(payload)
+            assert expected is not None
+            await self._async_send(payload)
+            if not await self._async_confirm_primary_state(
+                lambda: self._effect_state == expected
+            ):
+                raise AmaranConnectionError(
+                    f"{self.name} did not confirm its effect hue"
+                )
+
+    async def async_set_effect_saturation(self, saturation: float) -> None:
+        """Set saturation carried by an active system effect."""
+        async with self._operation_lock:
+            state2 = self._effect2_state
+            if state2 is not None:
+                if not state2.on or state2.saturation is None:
+                    raise AmaranConnectionError(
+                        f"{self.name} is not running a saturation-adjustable effect"
+                    )
+                target = max(0, min(100, math.floor(saturation + 0.5)))
+                await self._async_update_effect2_unlocked(
+                    error_label="saturation", saturation=target
+                )
+                return
+            state = self._effect_state
+            if state is None or not state.on or state.saturation is None:
+                raise AmaranConnectionError(
+                    f"{self.name} is not running a saturation-adjustable effect"
+                )
+            target = max(0, min(100, math.floor(saturation + 0.5)))
+            payload = self._effect_payload(state, saturation=target)
+            expected = telink.decode_effect(payload)
+            assert expected is not None
+            await self._async_send(payload)
+            if not await self._async_confirm_primary_state(
+                lambda: self._effect_state == expected
+            ):
+                raise AmaranConnectionError(
+                    f"{self.name} did not confirm its effect saturation"
+                )
+
+    async def async_set_effect_gm(self, gm: float) -> None:
+        """Set the app's G/M field on an active CCT-based system effect."""
+        async with self._operation_lock:
+            state2 = self._effect2_state
+            if state2 is not None:
+                if not self.profile.supports_gm or not state2.on or state2.gm is None:
+                    raise AmaranConnectionError(
+                        f"{self.name} is not running a G/M-adjustable effect"
+                    )
+                normalized = max(
+                    float(self.green_magenta_min),
+                    min(float(self.green_magenta_max), gm),
+                )
+                raw = math.floor((normalized + 10.0) * 10 + 0.5)
+                await self._async_update_effect2_unlocked(
+                    error_label="green/magenta shift", gm=raw
+                )
+                return
+            state = self._effect_state
+            if (
+                not self.profile.supports_gm
+                or state is None
+                or not state.on
+                or state.gm is None
+            ):
+                raise AmaranConnectionError(
+                    f"{self.name} is not running a G/M-adjustable effect"
+                )
+            normalized = max(
+                float(self.green_magenta_min),
+                min(float(self.green_magenta_max), gm),
+            )
+            gm_v2 = bool(self.profile.catalog_capabilities.steady_color.gm_v2_version)
+            raw = (
+                math.floor((normalized + 10.0) * 10 + 0.5)
+                if gm_v2
+                else 10 * math.floor((normalized + 10.0) + 0.5)
+            )
+            payload = self._effect_payload(state, gm=raw, gm_flag=gm_v2)
+            expected = telink.decode_effect(payload)
+            assert expected is not None
+            await self._async_send(payload)
+            if not await self._async_confirm_primary_state(
+                lambda: self._effect_state == expected
+            ):
+                raise AmaranConnectionError(
+                    f"{self.name} did not confirm its effect green/magenta shift"
+                )
+
     async def async_set_effect_variant(self, option: str) -> None:
-        """Set the app-defined colour preset of TV, Fire, or Fireworks."""
+        """Set the app-defined colour preset of the active effect."""
         async with self._operation_lock:
             state = self._effect_state
             options = self.effect_variant_options
@@ -623,7 +1443,11 @@ class AmaranLight:
             await self._async_refresh_state()
 
     async def _async_set_boost_unlocked(
-        self, enabled: bool, *, kelvin: int | None = None
+        self,
+        enabled: bool,
+        *,
+        kelvin: int | None = None,
+        gm: int | None = None,
     ) -> None:
         """Set Boost while the caller owns the device operation lock."""
         minimum = self.profile.boost_min_kelvin or self.profile.min_kelvin
@@ -635,7 +1459,8 @@ class AmaranLight:
                 else self._default_effect_kelvin()
             )
         kelvin = min(max(kelvin, minimum), maximum)
-        gm = self._boost_state.gm if self._boost_state is not None else 100
+        if gm is None:
+            gm = self._boost_state.gm if self._boost_state is not None else 100
         # The official app treats command 70 as a write-only modal session: it
         # sends state=1 while its Boost dialog is open, state=0 on dismiss, and
         # does not wait for or trust a state report. Ace 25x hardware likewise
@@ -669,6 +1494,25 @@ class AmaranLight:
             target = min(max(target, minimum), maximum)
             await self._async_set_boost_unlocked(state.enabled, kelvin=target)
 
+    async def async_set_boost_gm(self, gm: float) -> None:
+        """Adjust the Boost dialog's green/magenta value while it is active."""
+        if not (self.profile.supports_boost and self.profile.supports_gm):
+            raise AmaranConnectionError(f"Boost tint is not enabled for {self.name}")
+        async with self._operation_lock:
+            state = self._boost_state
+            if state is None or not state.enabled:
+                raise AmaranConnectionError(
+                    f"enable Boost on {self.name} before changing its tint"
+                )
+            # The original app widget stores M1.0..G1.0 as raw 0..200 with
+            # neutral at 100. Home Assistant exposes the familiar -10..+10.
+            target = math.floor((gm + 10) * 10 + 0.5)
+            target = max(
+                (self.green_magenta_min + 10) * 10,
+                min((self.green_magenta_max + 10) * 10, target),
+            )
+            await self._async_set_boost_unlocked(state.enabled, gm=target)
+
     async def async_set_fan_mode(self, mode: str) -> None:
         """Set a fixture-confirmed fan mode, then query its full report."""
         if mode not in self.profile.fan_modes:
@@ -692,7 +1536,15 @@ class AmaranLight:
                 raise AmaranConnectionError(f"{mode} is not supported by {self.name}")
 
             self._fan_received.clear()
-            await self._async_send(telink.fan(selected))
+            # Manual mode's packet carries the target RPM. Preserve the
+            # fixture's latest reported value instead of silently selecting
+            # 0 RPM when the mode is re-applied or first chosen.
+            fixture_speed = (
+                self._fan_state.fixture_speed
+                if selected is telink.FanMode.MANUAL and self._fan_state is not None
+                else 0
+            )
+            await self._async_send(telink.fan(selected, fixture_speed))
             # The official app always queries after a fan write. A set packet
             # echo lacks capability and temperature fields and is not enough
             # to confirm that the fixture applied the requested mode.
@@ -721,7 +1573,7 @@ class AmaranLight:
         """Apply light parameters, power, and state refresh as one operation."""
         async with self._operation_lock:
             state = self._state
-            effect_state = self._effect_state
+            effect_state = self.effect_state
             expected_gm = self._preferred_gm
             boost_active = self._boost_state is not None and self._boost_state.enabled
             if boost_active and (
@@ -729,6 +1581,45 @@ class AmaranLight:
             ):
                 await self._async_set_boost_unlocked(False)
                 boost_active = False
+            if self._effect2_state is not None and hs_color is None and kelvin is None:
+                await self._async_apply_effect2_unlocked(
+                    self._effect2_state.effect,
+                    intensity=intensity if brightness_changed else None,
+                )
+                return
+            if self._pixel_state is not None and hs_color is None and kelvin is None:
+                if not brightness_changed and self._pixel_state.on is True:
+                    # A control-only report after reconnect does not contain
+                    # the colour program. Rebuilding an already-on effect
+                    # would replace that program with defaults, so an
+                    # idempotent HA turn_on performs only a read-back.
+                    selected = self._pixel_state.effect
+                    if not await self._async_confirm_primary_state(
+                        lambda: (
+                            self._pixel_state is not None
+                            and self._pixel_state.effect is selected
+                            and self._pixel_state.on is True
+                        )
+                    ):
+                        raise AmaranConnectionError(
+                            f"{self.name} did not confirm its pixel effect state"
+                        )
+                    return
+                if brightness_changed and not _pixel_pages_complete(self._pixel_state):
+                    # A status report may contain only the control page. There
+                    # is no command-33 brightness-only packet, so rebuilding
+                    # here would silently replace unknown custom colours with
+                    # defaults. Make the limitation explicit; selecting the
+                    # effect again remains the intentional reset path.
+                    raise AmaranConnectionError(
+                        f"{self.name} has not reported its complete pixel program; "
+                        "reselect the effect before changing brightness"
+                    )
+                await self._async_apply_pixel_effect_unlocked(
+                    self._pixel_state.effect,
+                    intensity=intensity if brightness_changed else None,
+                )
+                return
             if effect_state is not None and hs_color is None and kelvin is None:
                 expected_intensity = (
                     intensity if brightness_changed else effect_state.intensity
@@ -766,7 +1657,13 @@ class AmaranLight:
 
             def steady_state_matches() -> bool:
                 current = self._state
-                if self._effect_state is not None or current is None or not current.on:
+                if (
+                    self._effect_state is not None
+                    or self._effect2_state is not None
+                    or self._pixel_state is not None
+                    or current is None
+                    or not current.on
+                ):
                     return False
                 if current.intensity != intensity and (
                     brightness_changed or hs_color is not None or kelvin is not None
@@ -796,6 +1693,8 @@ class AmaranLight:
         """Power down and refresh without interleaving another entity command."""
         async with self._operation_lock:
             boost_error: AmaranConnectionError | None = None
+            pixel_error: AmaranConnectionError | None = None
+            pixel_report_generation = self._pixel_report_generation
             if self._boost_state is not None and self._boost_state.enabled:
                 try:
                     await self._async_set_boost_unlocked(False)
@@ -803,12 +1702,35 @@ class AmaranLight:
                     # Safety beats perfect mode bookkeeping: an unavailable
                     # Boost exit write must never prevent the user's OFF.
                     boost_error = err
+            if self._pixel_state is not None and self._pixel_state.on:
+                try:
+                    # Pixel models use their STOP playback state when the app
+                    # builds the active effect with EffectState.OFF. Preserve
+                    # every reported colour page, then still send the ordinary
+                    # power-off command as the safety-critical final action.
+                    for payload in _pixel_payloads(
+                        self._pixel_state,
+                        intensity=None,
+                        on=False,
+                    ):
+                        await self._async_send(payload)
+                except AmaranConnectionError as err:
+                    pixel_error = err
             await self.async_turn_off()
             power_off_confirmed = await self._async_confirm_primary_state(
                 lambda: (
                     (self._effect_state is not None and not self._effect_state.on)
+                    or (self._effect2_state is not None and not self._effect2_state.on)
+                    or (
+                        self._pixel_state is not None
+                        and self._pixel_state.on is False
+                        and self._pixel_page_generations.get((2, 0), 0)
+                        > pixel_report_generation
+                    )
                     or (
                         self._effect_state is None
+                        and self._effect2_state is None
+                        and self._pixel_state is None
                         and self._state is not None
                         and not self._state.on
                     )
@@ -822,12 +1744,22 @@ class AmaranLight:
                 raise AmaranConnectionError(
                     f"{self.name} was turned off, but leaving Boost could not be sent"
                 ) from boost_error
+            if pixel_error is not None:
+                raise AmaranConnectionError(
+                    f"{self.name} was turned off, but stopping its pixel effect "
+                    "could not be sent"
+                ) from pixel_error
 
     async def async_set_gm(self, gm: float) -> None:
         """Set G/M in CCT mode, or remember it while the fixture is in HSI."""
         # Match the protocol's JavaScript-style half-up tie behavior while
         # keeping the cached Number state equal to what the fixture receives.
-        target = max(-10, min(10, math.floor(gm + 0.5)))
+        gm_v2 = bool(self.profile.catalog_capabilities.steady_color.gm_v2_version)
+        rounded = math.floor(gm * 10 + 0.5) / 10 if gm_v2 else math.floor(gm + 0.5)
+        target = max(
+            self.green_magenta_min,
+            min(self.green_magenta_max, rounded),
+        )
         async with self._operation_lock:
             previous = self._preferred_gm
             state = self._state
@@ -922,17 +1854,32 @@ class AmaranLight:
         return await self._async_wait_for(event, timeout)
 
     async def _async_refresh_diagnostics(self, *, include_version: bool) -> None:
-        """Refresh profile-gated Ace diagnostics independently of light state."""
+        """Probe app-catalog diagnostics independently of primary light state."""
+        cataloged = bool(self.profile.app_product_ids)
         if (
-            self.profile.supports_version
-            and (include_version or self._version_state is None)
+            (self.profile.supports_version or cataloged)
+            and include_version
             and not await self._async_refresh_optional(
                 telink.version_request(), self._version_received
             )
         ):
             _LOGGER.debug("%s did not report version data", self.address)
-        if self.profile.supports_power and not await self._async_refresh_optional(
-            telink.power_request(), self._power_received
+        if (
+            cataloged
+            and include_version
+            and not await self._async_refresh_optional(
+                telink.version2_request(), self._version2_received
+            )
+        ):
+            _LOGGER.debug("%s did not report advanced capability data", self.address)
+        # Power is not declared statically by the app. Probe every named model
+        # once per connection; only keep polling fixtures that answer.
+        if (
+            (self.profile.supports_power or cataloged)
+            and (include_version or self._power_state is not None)
+            and not await self._async_refresh_optional(
+                telink.power_request(), self._power_received
+            )
         ):
             _LOGGER.debug("%s did not report power data", self.address)
         if self.profile.supports_fan and not await self._async_refresh_optional(
@@ -1128,18 +2075,31 @@ class AmaranLight:
             for report in (
                 self._state,
                 self._effect_state,
+                self._effect2_state,
+                self._pixel_state,
                 self._boost_state,
                 self._fan_state,
                 self._power_state,
                 self._version_state,
+                self._version2_state,
+                self._high_speed_state,
             )
         )
         self._state = None
         self._effect_state = None
+        self._effect2_state = None
+        self._pixel_state = None
+        # Keep the generation monotonic across reconnects. An operation can
+        # capture the current value immediately before a send causes a
+        # reconnect; resetting it here would make every valid report from the
+        # new session look older than that operation.
+        self._pixel_page_generations.clear()
         self._boost_state = None
         self._fan_state = None
         self._power_state = None
         self._version_state = None
+        self._version2_state = None
+        self._high_speed_state = None
         self._missed_polls = 0
         for event in (
             self._state_received,
@@ -1147,6 +2107,8 @@ class AmaranLight:
             self._fan_received,
             self._power_received,
             self._version_received,
+            self._version2_received,
+            self._high_speed_received,
         ):
             event.clear()
         if changed:
@@ -1198,7 +2160,12 @@ class AmaranLight:
         while not self._closing:
             await asyncio.sleep(
                 POLL_INTERVAL
-                if (self._state is not None or self._effect_state is not None)
+                if (
+                    self._state is not None
+                    or self._effect_state is not None
+                    or self._effect2_state is not None
+                    or self._pixel_state is not None
+                )
                 else INITIAL_POLL_INTERVAL
             )
             if self._closing:
@@ -1276,10 +2243,15 @@ class AmaranLight:
     def _on_access_message(self, message: AccessMessage) -> None:
         if message.opcode != telink.OPCODE or message.src != self._unicast_address:
             return
-        # Bit 79 is the proprietary write flag. ProxyClient already filters
-        # our relayed network packets, and a fixture report clears this bit.
-        # Refuse write-form echoes so a command cannot confirm itself.
-        if len(message.parameters) != 10 or message.parameters[9] & 0x80:
+        # Bit 79 is the proprietary write flag for the common command family.
+        # Command 53 is exceptional: its app builder emits operation 0 and its
+        # exact layout also permits operation 1. ProxyClient filters our own
+        # relayed network packet, so accept either command-53 form while still
+        # refusing write-form echoes for every other command.
+        if len(message.parameters) != 10:
+            return
+        command = message.parameters[9] & 0x7F
+        if message.parameters[9] & 0x80 and command != highspeed.CMD_HIGH_SPEED:
             return
         report = telink.decode_report(
             message.parameters,
@@ -1289,6 +2261,12 @@ class AmaranLight:
                 else 0
             ),
         )
+        if report is None:
+            report = systemfx2.decode_report2(message.parameters)
+        if report is None:
+            report = pixelfx.decode(message.parameters)
+        if report is None:
+            report = highspeed.decode_high_speed(message.parameters)
         if report is None:
             return
 
@@ -1312,15 +2290,20 @@ class AmaranLight:
             changed = (
                 report != self._state
                 or self._effect_state is not None
+                or self._effect2_state is not None
+                or self._pixel_state is not None
                 or self._boost_state != previous_boost
                 or self._preferred_gm != previous_gm
             )
             self._state = report
             self._effect_state = None
+            self._effect2_state = None
+            self._pixel_state = None
+            self._pixel_page_generations.clear()
             self._missed_polls = 0
             self._state_received.set()
         elif isinstance(report, telink.EffectState):
-            if not self.profile.supports_effects:
+            if report.effect.value not in self.profile.effects:
                 return
             previous_boost = self._boost_state
             new_effect = None if report.effect is telink.SystemEffect.OFF else report
@@ -1333,9 +2316,63 @@ class AmaranLight:
                     100,
                 )
             changed = (
-                new_effect != self._effect_state or self._boost_state != previous_boost
+                new_effect != self._effect_state
+                or self._effect2_state is not None
+                or self._pixel_state is not None
+                or self._boost_state != previous_boost
             )
             self._effect_state = new_effect
+            self._effect2_state = None
+            self._pixel_state = None
+            self._pixel_page_generations.clear()
+            self._missed_polls = 0
+            self._state_received.set()
+        elif isinstance(report, systemfx2.SystemEffect2State):
+            if report.effect.value not in self.profile.system_effects2:
+                return
+            previous_boost = self._boost_state
+            merged = systemfx2.merge_effect2_states(self._effect2_state, report)
+            if self.profile.supports_boost and self._boost_state is None:
+                minimum = self.profile.boost_min_kelvin or self.profile.min_kelvin
+                maximum = self.profile.boost_max_kelvin or self.profile.max_kelvin
+                self._boost_state = telink.BoostState(
+                    False,
+                    min(max(self._default_effect_kelvin(), minimum), maximum),
+                    100,
+                )
+            changed = (
+                merged != self._effect2_state
+                or self._effect_state is not None
+                or self._pixel_state is not None
+                or self._boost_state != previous_boost
+            )
+            self._effect2_state = merged
+            self._effect_state = None
+            self._pixel_state = None
+            self._pixel_page_generations.clear()
+            self._missed_polls = 0
+            self._state_received.set()
+        elif isinstance(report, pixelfx.PixelEffectState):
+            if report.effect.value not in self.profile.pixel_effects:
+                return
+            if (
+                self._pixel_state is None
+                or self._pixel_state.effect is not report.effect
+            ):
+                self._pixel_page_generations.clear()
+            self._pixel_report_generation += 1
+            self._pixel_page_generations[_pixel_page_key(report)] = (
+                self._pixel_report_generation
+            )
+            merged = _merge_pixel_page(self._pixel_state, report)
+            changed = (
+                merged != self._pixel_state
+                or self._effect_state is not None
+                or self._effect2_state is not None
+            )
+            self._pixel_state = merged
+            self._effect_state = None
+            self._effect2_state = None
             self._missed_polls = 0
             self._state_received.set()
         elif isinstance(report, telink.BoostState):
@@ -1356,17 +2393,29 @@ class AmaranLight:
             self._fan_state = report
             self._fan_received.set()
         elif isinstance(report, telink.PowerState):
-            if not self.profile.supports_power:
+            if not (self.profile.supports_power or self.profile.app_product_ids):
                 return
             changed = report != self._power_state
             self._power_state = report
             self._power_received.set()
         elif isinstance(report, telink.VersionState):
-            if not self.profile.supports_version:
+            if not (self.profile.supports_version or self.profile.app_product_ids):
                 return
             changed = report != self._version_state
             self._version_state = report
             self._version_received.set()
+        elif isinstance(report, telink.Version2State):
+            if not self.profile.app_product_ids:
+                return
+            changed = report != self._version2_state
+            self._version2_state = report
+            self._version2_received.set()
+        elif isinstance(report, highspeed.HighSpeedMessage):
+            if not self.profile.catalog_capabilities.high_speed_photography.supported:
+                return
+            changed = report != self._high_speed_state
+            self._high_speed_state = report
+            self._high_speed_received.set()
 
         # Always release the matching waiter; an unchanged report still proves
         # the fixture answered the request.

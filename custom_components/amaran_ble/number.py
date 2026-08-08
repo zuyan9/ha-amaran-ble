@@ -11,6 +11,7 @@ from homeassistant.helpers.device_registry import CONNECTION_BLUETOOTH, DeviceIn
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import AmaranConfigEntry
+from .amaranble import systemfx2
 from .const import (
     CONF_SUPPORTS_CCT,
     CONF_SUPPORTS_GM,
@@ -21,9 +22,17 @@ from .const import (
     PROFILE_GENERIC,
 )
 from .device import AmaranConnectionError, AmaranLight
-from .profiles import profile_for_entry
+from .profiles import FixtureProfile, profile_for_entry
 
 PARALLEL_UPDATES = 1
+
+
+def _system_effect2_supports(profile: FixtureProfile, field: str) -> bool:
+    """Return whether any selectable command-34 effect carries one field."""
+    return any(
+        field in systemfx2.system_effect2_fields(effect)
+        for effect in profile.system_effects2
+    )
 
 
 def _gm_unique_id(address: str) -> str:
@@ -34,8 +43,24 @@ def _effect_cct_unique_id(address: str) -> str:
     return f"{address}_effect_cct"
 
 
+def _effect_hue_unique_id(address: str) -> str:
+    return f"{address}_effect_hue"
+
+
+def _effect_saturation_unique_id(address: str) -> str:
+    return f"{address}_effect_saturation"
+
+
+def _effect_gm_unique_id(address: str) -> str:
+    return f"{address}_effect_gm"
+
+
 def _boost_cct_unique_id(address: str) -> str:
     return f"{address}_boost_cct"
+
+
+def _boost_gm_unique_id(address: str) -> str:
+    return f"{address}_boost_gm"
 
 
 def _remove_registered_entity(hass: HomeAssistant, unique_id: str) -> None:
@@ -69,15 +94,81 @@ async def async_setup_entry(
     else:
         _remove_registered_entity(hass, _gm_unique_id(address))
 
-    if profile.supports_effects:
+    cct_effects = {
+        "Paparazzi",
+        "Lightning",
+        "Faulty Bulb",
+        "Pulsing",
+        "Strobe",
+        "Explosion",
+        "Welding",
+    }
+    if (
+        profile.supports_cct
+        and profile.min_kelvin < profile.max_kelvin
+        and (
+            any(effect in cct_effects for effect in profile.effects)
+            or _system_effect2_supports(profile, "kelvin")
+        )
+    ):
         entities.append(AmaranEffectColorTemperatureEntity(entry))
     else:
         _remove_registered_entity(hass, _effect_cct_unique_id(address))
+
+    hsi_effects = {
+        "Faulty Bulb",
+        "Pulsing",
+        "Strobe",
+        "Explosion",
+        "Welding",
+    }
+    if (
+        profile.supports_color
+        and any(effect in hsi_effects for effect in profile.effects)
+    ) or _system_effect2_supports(profile, "hue"):
+        entities.append(AmaranEffectHueEntity(entry))
+    else:
+        _remove_registered_entity(hass, _effect_hue_unique_id(address))
+
+    saturation_effects = {"Color Chase", "Party Lights"}
+    if (
+        (
+            profile.supports_color
+            and any(effect in hsi_effects for effect in profile.effects)
+        )
+        or any(effect in saturation_effects for effect in profile.effects)
+        or _system_effect2_supports(profile, "saturation")
+    ):
+        entities.append(AmaranEffectSaturationEntity(entry))
+    else:
+        _remove_registered_entity(hass, _effect_saturation_unique_id(address))
+
+    gm_effects = {
+        "Paparazzi",
+        "Lightning",
+        "Faulty Bulb",
+        "Pulsing",
+        "Strobe",
+        "Explosion",
+        "Welding",
+    }
+    if profile.supports_gm and (
+        any(effect in gm_effects for effect in profile.effects)
+        or _system_effect2_supports(profile, "gm")
+    ):
+        entities.append(AmaranEffectGreenMagentaEntity(entry))
+    else:
+        _remove_registered_entity(hass, _effect_gm_unique_id(address))
 
     if profile.supports_boost:
         entities.append(AmaranBoostColorTemperatureEntity(entry))
     else:
         _remove_registered_entity(hass, _boost_cct_unique_id(address))
+
+    if profile.supports_boost and profile.supports_gm:
+        entities.append(AmaranBoostGreenMagentaEntity(entry))
+    else:
+        _remove_registered_entity(hass, _boost_gm_unique_id(address))
 
     if entities:
         async_add_entities(entities)
@@ -99,10 +190,14 @@ class AmaranGreenMagentaEntity(NumberEntity):
         self._device: AmaranLight = entry.runtime_data
         address = entry.data[CONF_ADDRESS]
         self._attr_unique_id = _gm_unique_id(address)
+        self._attr_native_min_value = self._device.green_magenta_min
+        self._attr_native_max_value = self._device.green_magenta_max
+        if self._device.profile.catalog_capabilities.steady_color.gm_v2_version:
+            self._attr_native_step = 0.1
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, address)},
             connections={(CONNECTION_BLUETOOTH, address)},
-            manufacturer=MANUFACTURER,
+            manufacturer=self._device.profile.manufacturer or MANUFACTURER,
             name=entry.title,
         )
 
@@ -118,7 +213,7 @@ class AmaranGreenMagentaEntity(NumberEntity):
         return self._device.available
 
     @property
-    def native_value(self) -> int:
+    def native_value(self) -> float:
         return self._device.preferred_gm
 
     async def async_set_native_value(self, value: float) -> None:
@@ -153,7 +248,7 @@ class _AmaranColorTemperatureEntity(NumberEntity):
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, address)},
             connections={(CONNECTION_BLUETOOTH, address)},
-            manufacturer=MANUFACTURER,
+            manufacturer=self._device.profile.manufacturer or MANUFACTURER,
             name=entry.title,
         )
 
@@ -189,11 +284,124 @@ class AmaranEffectColorTemperatureEntity(_AmaranColorTemperatureEntity):
     @property
     def native_value(self) -> int | None:
         state = self._device.effect_state
-        return None if state is None else state.kelvin
+        return None if state is None else getattr(state, "kelvin", None)
 
     async def async_set_native_value(self, value: float) -> None:
         try:
             await self._device.async_set_effect_kelvin(value)
+        except AmaranConnectionError as err:
+            raise HomeAssistantError(str(err)) from err
+
+
+class _AmaranEffectParameterEntity(NumberEntity):
+    """Shared wiring for numeric parameters carried by an active effect."""
+
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+    _attr_native_step = 1
+    _attr_mode = NumberMode.SLIDER
+
+    def __init__(self, entry: AmaranConfigEntry, unique_id: str) -> None:
+        self._device: AmaranLight = entry.runtime_data
+        address = entry.data[CONF_ADDRESS]
+        self._attr_unique_id = unique_id
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, address)},
+            connections={(CONNECTION_BLUETOOTH, address)},
+            manufacturer=self._device.profile.manufacturer or MANUFACTURER,
+            name=entry.title,
+        )
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(self._device.add_listener(self._handle_update))
+
+    @callback
+    def _handle_update(self) -> None:
+        self.async_write_ha_state()
+
+
+class AmaranEffectHueEntity(_AmaranEffectParameterEntity):
+    """Hue carried by an active HSI-capable system effect."""
+
+    _attr_translation_key = "effect_hue"
+    _attr_icon = "mdi:palette"
+    _attr_native_min_value = 0
+    _attr_native_max_value = 360
+
+    def __init__(self, entry: AmaranConfigEntry) -> None:
+        super().__init__(entry, _effect_hue_unique_id(entry.data[CONF_ADDRESS]))
+
+    @property
+    def available(self) -> bool:
+        return self._device.connected and self._device.effect_hue_available
+
+    @property
+    def native_value(self) -> int | None:
+        state = self._device.effect_state
+        return None if state is None else getattr(state, "hue", None)
+
+    async def async_set_native_value(self, value: float) -> None:
+        try:
+            await self._device.async_set_effect_hue(value)
+        except AmaranConnectionError as err:
+            raise HomeAssistantError(str(err)) from err
+
+
+class AmaranEffectSaturationEntity(_AmaranEffectParameterEntity):
+    """Saturation carried by an active system effect."""
+
+    _attr_translation_key = "effect_saturation"
+    _attr_icon = "mdi:water-opacity"
+    _attr_native_min_value = 0
+    _attr_native_max_value = 100
+
+    def __init__(self, entry: AmaranConfigEntry) -> None:
+        super().__init__(entry, _effect_saturation_unique_id(entry.data[CONF_ADDRESS]))
+
+    @property
+    def available(self) -> bool:
+        return self._device.connected and self._device.effect_saturation_available
+
+    @property
+    def native_value(self) -> int | None:
+        state = self._device.effect_state
+        return None if state is None else getattr(state, "saturation", None)
+
+    async def async_set_native_value(self, value: float) -> None:
+        try:
+            await self._device.async_set_effect_saturation(value)
+        except AmaranConnectionError as err:
+            raise HomeAssistantError(str(err)) from err
+
+
+class AmaranEffectGreenMagentaEntity(_AmaranEffectParameterEntity):
+    """Green/magenta tint carried by an active CCT-based system effect."""
+
+    _attr_translation_key = "effect_green_magenta"
+    _attr_icon = "mdi:invert-colors"
+    _attr_native_min_value = -10
+    _attr_native_max_value = 10
+
+    def __init__(self, entry: AmaranConfigEntry) -> None:
+        super().__init__(entry, _effect_gm_unique_id(entry.data[CONF_ADDRESS]))
+        self._attr_native_min_value = self._device.green_magenta_min
+        self._attr_native_max_value = self._device.green_magenta_max
+        if self._device.profile.catalog_capabilities.steady_color.gm_v2_version:
+            self._attr_native_step = 0.1
+
+    @property
+    def available(self) -> bool:
+        return self._device.connected and self._device.effect_gm_available
+
+    @property
+    def native_value(self) -> float | None:
+        state = self._device.effect_state
+        gm = None if state is None else getattr(state, "gm", None)
+        return None if gm is None else gm / 10 - 10
+
+    async def async_set_native_value(self, value: float) -> None:
+        try:
+            await self._device.async_set_effect_gm(value)
         except AmaranConnectionError as err:
             raise HomeAssistantError(str(err)) from err
 
@@ -226,5 +434,54 @@ class AmaranBoostColorTemperatureEntity(_AmaranColorTemperatureEntity):
     async def async_set_native_value(self, value: float) -> None:
         try:
             await self._device.async_set_boost_kelvin(value)
+        except AmaranConnectionError as err:
+            raise HomeAssistantError(str(err)) from err
+
+
+class AmaranBoostGreenMagentaEntity(NumberEntity):
+    """Green/magenta tint used by a full-colour fixture's Boost dialog."""
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "boost_green_magenta"
+    _attr_icon = "mdi:invert-colors"
+    _attr_should_poll = False
+    _attr_native_min_value = -10
+    _attr_native_max_value = 10
+    _attr_native_step = 0.1
+    _attr_mode = NumberMode.SLIDER
+
+    def __init__(self, entry: AmaranConfigEntry) -> None:
+        self._device: AmaranLight = entry.runtime_data
+        address = entry.data[CONF_ADDRESS]
+        self._attr_unique_id = _boost_gm_unique_id(address)
+        self._attr_native_min_value = self._device.green_magenta_min
+        self._attr_native_max_value = self._device.green_magenta_max
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, address)},
+            connections={(CONNECTION_BLUETOOTH, address)},
+            manufacturer=self._device.profile.manufacturer or MANUFACTURER,
+            name=entry.title,
+        )
+
+    async def async_added_to_hass(self) -> None:
+        self.async_on_remove(self._device.add_listener(self._handle_update))
+
+    @callback
+    def _handle_update(self) -> None:
+        self.async_write_ha_state()
+
+    @property
+    def available(self) -> bool:
+        state = self._device.boost_state
+        return self._device.connected and state is not None and state.enabled
+
+    @property
+    def native_value(self) -> float | None:
+        state = self._device.boost_state
+        return None if state is None else state.gm / 10 - 10
+
+    async def async_set_native_value(self, value: float) -> None:
+        try:
+            await self._device.async_set_boost_gm(value)
         except AmaranConnectionError as err:
             raise HomeAssistantError(str(err)) from err

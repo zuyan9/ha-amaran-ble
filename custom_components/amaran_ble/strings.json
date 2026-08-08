@@ -21,7 +21,7 @@
           "max_kelvin": "Maximum colour temperature"
         },
         "data_description": {
-          "model": "Choose Ace 25x to enable its verified effects, Boost, fan, battery, and version controls. Use Generic for other fixtures.",
+          "model": "Choose the exact app model to apply its cataloged light modes, rated color-temperature range, effects, fan, and Boost capabilities. Ace 25x is hardware-tested; every other named profile is experimental. Use Generic only when the model is not listed.",
           "supports_cct": "Turn this off for fixed-daylight fixtures. Models ending in 'x' normally support this; models ending in 'd' normally do not.",
           "supports_color": "Enable this for full-colour fixtures such as models ending in 'c'.",
           "supports_gm": "Adds a separate G/M slider. Enable it only when the fixture supports tint adjustment in CCT mode.",
@@ -58,7 +58,7 @@
           "max_kelvin": "Maximum colour temperature"
         },
         "data_description": {
-          "model": "Ace 25x uses its verified fixed capabilities. Generic uses the capability fields below.",
+          "model": "Named models use capabilities extracted from the app. Ace 25x is hardware-tested; all other named profiles are experimental. Generic uses the capability fields below.",
           "supports_cct": "Turn this off for fixed-daylight fixtures.",
           "supports_color": "Enable this for full-colour fixtures with HSI control.",
           "supports_gm": "Adds a separate G/M slider and requires adjustable colour temperature.",
@@ -78,8 +78,20 @@
       "boost_color_temperature": {
         "name": "Boost color temperature"
       },
+      "boost_green_magenta": {
+        "name": "Boost green/magenta"
+      },
       "effect_color_temperature": {
         "name": "Effect color temperature"
+      },
+      "effect_green_magenta": {
+        "name": "Effect green/magenta"
+      },
+      "effect_hue": {
+        "name": "Effect hue"
+      },
+      "effect_saturation": {
+        "name": "Effect saturation"
       },
       "green_magenta": {
         "name": "Green/magenta"
@@ -89,9 +101,14 @@
       "effect_color": {
         "name": "Effect color",
         "state": {
+          "blue": "Blue",
+          "blue_white": "Blue + white",
           "cooler": "Cooler",
           "multi": "Multi",
           "natural": "Natural",
+          "red": "Red",
+          "red_blue": "Red + blue",
+          "red_blue_white": "Red + blue + white",
           "warmer": "Warmer"
         }
       },
@@ -104,6 +121,12 @@
       "fan_mode": {
         "name": "Fan mode",
         "state": {
+          "high": "High",
+          "low": "Low",
+          "manual": "Manual",
+          "max": "Maximum",
+          "medium": "Medium",
+          "off": "Off",
           "silent": "Silent",
           "smart": "Smart"
         }
@@ -136,6 +159,9 @@
     "switch": {
       "boost": {
         "name": "Boost"
+      },
+      "high_speed_photography": {
+        "name": "High-speed photography"
       }
     }
   }

@@ -52,7 +52,9 @@ def _to_intensity(brightness: int) -> int:
 
 
 def _to_brightness(intensity: int) -> int:
-    return max(1, round(intensity / MAX_INTENSITY * 255))
+    # The proprietary field is ten bits wide, although the app's normal UI
+    # range ends at 1000. Keep unusual but valid reports inside HA's contract.
+    return max(1, min(255, round(intensity / MAX_INTENSITY * 255)))
 
 
 async def async_setup_entry(
@@ -78,7 +80,7 @@ class AmaranLightEntity(LightEntity):
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, address)},
             connections={(CONNECTION_BLUETOOTH, address)},
-            manufacturer=MANUFACTURER,
+            manufacturer=self._device.profile.manufacturer or MANUFACTURER,
             model=self._device.profile.name,
             name=entry.title,
         )
@@ -110,7 +112,7 @@ class AmaranLightEntity(LightEntity):
         self._attr_supported_color_modes = supported_color_modes
         if profile.supports_effects:
             self._attr_supported_features = LightEntityFeature.EFFECT
-            self._attr_effect_list = list(profile.effects)
+            self._attr_effect_list = list(profile.all_effects)
 
         if self._supports_cct:
             self._attr_min_color_temp_kelvin = self._min_kelvin
@@ -138,7 +140,7 @@ class AmaranLightEntity(LightEntity):
     @property
     def brightness(self) -> int | None:
         effect = self._device.effect_state
-        if effect is not None:
+        if effect is not None and effect.intensity is not None:
             return _to_brightness(effect.intensity)
         state = self._device.state
         return None if state is None else _to_brightness(state.intensity)
@@ -205,7 +207,11 @@ class AmaranLightEntity(LightEntity):
 
         if brightness is not None:
             intensity = _to_intensity(brightness)
-        elif effect_state is not None and effect_state.intensity > 0:
+        elif (
+            effect_state is not None
+            and effect_state.intensity is not None
+            and effect_state.intensity > 0
+        ):
             intensity = effect_state.intensity
         elif state is not None and state.intensity > 0:
             intensity = state.intensity

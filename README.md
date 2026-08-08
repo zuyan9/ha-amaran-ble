@@ -21,16 +21,16 @@ No amaran account, vendor cloud service, MQTT, or vendor bridge is required.
 
 ## Features
 
-- Fully local power, brightness, CCT, HSI colour, and optional green/magenta
-  control
+- Named profiles for 77 amaran and Aputure models represented by 80 product IDs
+  in the app's bundled fixture catalog
+- Fully local power, brightness, model-specific CCT ranges, HSI colour, and
+  green/magenta control where supported
+- Cataloged legacy effects and defaults-proven generation-II effects with
+  selected rate and colour parameters, plus seven multi-zone pixel effects
+- Profile-gated Boost, fan, power/runtime, firmware diagnostics, and
+  high-speed-photography controls
 - Live state updates, automatic reconnection, and crash-safe Bluetooth Mesh
   sequence handling
-- A dedicated **Ace 25x** profile with:
-  - All nine built-in effects, effect intensity, rate/Random, CCT, and colour
-    presets
-  - Boost mode and its 3800–5500 K colour-temperature control
-  - Report-confirmed fan modes, fan speed, and internal temperature
-  - Battery level, estimated runtime, power source, and firmware diagnostics
 - Setup and model/capability options through the Home Assistant UI
 
 Some effects flash rapidly. Use Strobe, Lightning, Explosion, Paparazzi, and
@@ -38,14 +38,23 @@ Fireworks with appropriate photosensitivity precautions.
 
 ## Compatibility
 
-The **Ace 25x** is the hardware-tested model. Select its named profile to enable
-the model-specific controls above.
+The **Ace 25x** is the only hardware-tested model. Every other named model is an
+experimental best-effort profile derived from the official app's bundled
+capability data and reverse-engineered protocol code. Select the exact model;
+use **Generic** only when it is not listed.
 
-Other single-zone Telink-based amaran/Aputure fixtures may work using the
-**Generic** profile. Their power, brightness, CCT, HSI, and G/M capabilities are
-configured manually and remain experimental. Multi-zone/pixel effects, groups,
-scenes, app shortcuts, USB output, physical-button settings, factory reset,
-and firmware updates are not currently exposed.
+The integration currently exposes capabilities whose packet layout, range, and
+safe defaults are known. It also includes tested low-level codecs for additional
+app protocol families—including RGBW, Gel, XY, generation-III effects,
+partitions, Magic Pixel, motion, and manual effects—but does not present those
+as Home Assistant controls where the app did not reveal safe units, defaults,
+or state transitions. Program/Picker/Music/Touchbar effects, groups, scenes,
+Quickshots, OTA updates, USB output, and physical-button settings are not yet
+user-facing.
+
+Some models may use a different or relay-only Mesh proxy path. In particular,
+the upstream project controls the Halo 100x through another fixture, so direct
+Halo provisioning remains especially uncertain.
 
 The light-control foundation builds on the protocol reverse engineered by
 [wesbos/amaran-BLE-control](https://github.com/wesbos/amaran-BLE-control).
@@ -54,19 +63,19 @@ The light-control foundation builds on the protocol reverse engineered by
 
 - Home Assistant 2026.8.0 or newer
 - A connectable Home Assistant Bluetooth adapter or Bluetooth proxy
-- A factory-reset amaran light within Bluetooth range
+- A factory-reset supported amaran/Aputure fixture within Bluetooth range
 
 ## Setup
 
-1. Remove the light from Sidus Link, then factory-reset its Bluetooth/Mesh
+1. Remove the fixture from Sidus Link, then factory-reset its Bluetooth/Mesh
    settings.
-2. Keep the light powered on and close to a connectable Bluetooth adapter.
+2. Keep the fixture powered on and close to a connectable Bluetooth adapter.
 3. In Home Assistant, open **Settings → Devices & services → Add integration**.
 4. Select **amaran BLE**, choose the discovered light, and select its model.
 
 For an existing installation, open **Settings → Devices & services → amaran
-BLE → Configure**, select **amaran Ace 25x**, and save to add its extended
-entities.
+BLE → Configure**, select the exact fixture model, and save to reload its
+profile-specific entities.
 
 ## Troubleshooting
 
