@@ -56,7 +56,6 @@
   "issues": {
     "factory_reset": {
       "title": "{name} was factory reset",
-      "description": "{name} is advertising as an unprovisioned fixture and no longer accepts the Bluetooth Mesh credentials stored by Home Assistant. Run the repair to provision it back into the same integration entry without replacing its entities or device.",
       "fix_flow": {
         "abort": {
           "entry_removed": "The integration entry has already been removed."
@@ -69,7 +68,7 @@
         "step": {
           "init": {
             "title": "Re-provision {name}",
-            "description": "Select the physical fixture that belongs to {name}. Submit provisions it into Home Assistant's private Bluetooth Mesh and updates the existing entry in place. If no fixture is listed, factory reset and power on the intended light, then submit to scan again.",
+            "description": "Select the physical fixture that belongs to {name}. Submitting the form provisions it into Home Assistant's private Bluetooth Mesh and updates the existing entry in place. If no fixture is listed, factory reset and power on the intended light, then submit to scan again.",
             "data": {
               "address": "Factory-reset fixture"
             }
