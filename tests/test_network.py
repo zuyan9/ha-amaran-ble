@@ -65,6 +65,46 @@ def test_network_rejects_wrong_key_and_tampering() -> None:
         network.decode_network_pdu(keys, 0, encoded + b"too long" * 3)
 
 
+def test_mesh_proxy_network_id_identifies_only_its_private_subnet() -> None:
+    """Network ID accepts this NetKey and rejects another private subnet."""
+    keys = network.NetworkKeys.derive(NET_KEY)
+    service_data = b"\x00" + keys.network_id
+
+    assert (
+        keys.proxy_identity_match(service_data, 2)
+        is network.ProxyIdentityMatch.NETWORK_ID
+    )
+    assert (
+        network.NetworkKeys.derive(b"x" * 16).proxy_identity_match(service_data, 2)
+        is None
+    )
+    assert keys.proxy_identity_match(service_data[:-1], 2) is None
+    assert keys.proxy_identity_match(service_data + b"\x00", 2) is None
+
+
+def test_mesh_proxy_node_identity_binds_random_advert_to_unicast_node() -> None:
+    """Node Identity cannot be reused for another node or another NetKey."""
+    keys = network.NetworkKeys.derive(NET_KEY)
+    random_value = bytes.fromhex("1032547698badcfe")
+    identity_hash = crypto.aes_ecb(
+        keys.identity_key,
+        b"\x00" * 6 + random_value + (2).to_bytes(2, "big"),
+    )[8:]
+    service_data = b"\x01" + identity_hash + random_value
+
+    assert (
+        keys.proxy_identity_match(service_data, 2)
+        is network.ProxyIdentityMatch.NODE_IDENTITY
+    )
+    assert keys.proxy_identity_match(service_data, 3) is None
+    assert (
+        network.NetworkKeys.derive(b"x" * 16).proxy_identity_match(service_data, 2)
+        is None
+    )
+    assert keys.proxy_identity_match(service_data[:-1], 2) is None
+    assert keys.proxy_identity_match(service_data + b"\x00", 2) is None
+
+
 def test_proxy_configuration_matches_mesh_profile_vector() -> None:
     """Match the Bluetooth Mesh Profile 1.1 Set Filter Type sample."""
     keys = network.NetworkKeys.derive(bytes.fromhex("d1aafb2a1a3c281cbdb0e960edfad852"))

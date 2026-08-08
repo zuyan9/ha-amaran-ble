@@ -28,10 +28,18 @@
           "min_kelvin": "Use your fixture's rated range; it is ignored when adjustable colour temperature is off.",
           "max_kelvin": "The protocol carries 800 K to 20000 K; use the fixture's rated maximum."
         }
+      },
+      "reconfigure": {
+        "title": "Re-provision {name}",
+        "description": "Choose the factory-reset fixture that should remain linked to {name}. Home Assistant will create fresh Bluetooth Mesh credentials while preserving this integration entry, its device, and all entity IDs.",
+        "data": {
+          "address": "Factory-reset fixture"
+        }
       }
     },
     "error": {
       "cannot_connect": "Could not connect to the fixture. Move it closer to a Bluetooth adapter or proxy and try again.",
+      "no_devices_found": "No factory-reset amaran fixture is visible. Power on and factory reset the intended light, then try again.",
       "provisioning_failed": "Provisioning failed. Factory reset the fixture and try again.",
       "invalid_range": "The maximum colour temperature must be higher than the minimum.",
       "gm_requires_cct": "Green/magenta adjustment requires adjustable colour temperature.",
@@ -40,8 +48,34 @@
     },
     "abort": {
       "already_configured": "This fixture is already set up.",
+      "reconfigure_successful": "The fixture was re-provisioned successfully.",
       "no_devices_found": "No amaran fixtures found. Make sure the light is powered on and factory reset.",
       "not_supported": "This device is not a supported amaran fixture."
+    }
+  },
+  "issues": {
+    "factory_reset": {
+      "title": "{name} was factory reset",
+      "description": "{name} is advertising as an unprovisioned fixture and no longer accepts the Bluetooth Mesh credentials stored by Home Assistant. Run the repair to provision it back into the same integration entry without replacing its entities or device.",
+      "fix_flow": {
+        "abort": {
+          "entry_removed": "The integration entry has already been removed."
+        },
+        "error": {
+          "cannot_connect": "Could not verify the fixture's live provisioning service. Move it closer to a Bluetooth adapter or proxy and try again.",
+          "no_devices_found": "No factory-reset amaran fixture is visible. Power on and factory reset the intended light, then try again.",
+          "provisioning_failed": "Re-provisioning failed safely. The existing Home Assistant entry was not replaced; factory reset the fixture and try again."
+        },
+        "step": {
+          "init": {
+            "title": "Re-provision {name}",
+            "description": "Select the physical fixture that belongs to {name}. Submit provisions it into Home Assistant's private Bluetooth Mesh and updates the existing entry in place. If no fixture is listed, factory reset and power on the intended light, then submit to scan again.",
+            "data": {
+              "address": "Factory-reset fixture"
+            }
+          }
+        }
+      }
     }
   },
   "options": {

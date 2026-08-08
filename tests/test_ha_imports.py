@@ -6,8 +6,6 @@ import importlib
 
 import pytest
 
-pytest.importorskip("homeassistant")
-
 
 @pytest.mark.parametrize(
     "module",
@@ -19,6 +17,9 @@ pytest.importorskip("homeassistant")
         "custom_components.amaran_ble.number",
         "custom_components.amaran_ble.pending",
         "custom_components.amaran_ble.profiles",
+        "custom_components.amaran_ble.reconfiguration",
+        "custom_components.amaran_ble.repairs",
+        "custom_components.amaran_ble.resolver",
         "custom_components.amaran_ble.select",
         "custom_components.amaran_ble.sensor",
         "custom_components.amaran_ble.switch",

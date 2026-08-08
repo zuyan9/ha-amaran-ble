@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
-
-pytest.importorskip("homeassistant")
 
 from custom_components.amaran_ble import device
 from custom_components.amaran_ble.amaranble import (
@@ -38,7 +37,7 @@ class FakeStore:
 
 
 def make_light(
-    monkeypatch: pytest.MonkeyPatch, *, profile=GENERIC_PROFILE
+    monkeypatch: pytest.MonkeyPatch, *, profile=GENERIC_PROFILE, **kwargs: Any
 ) -> device.AmaranLight:
     """Build a device without touching Home Assistant's real storage manager."""
     monkeypatch.setattr(
@@ -58,6 +57,7 @@ def make_light(
         local_address=1,
         iv_index=0,
         profile=profile,
+        **kwargs,
     )
 
 
@@ -232,7 +232,9 @@ async def test_async_stop_cannot_lose_race_with_inflight_connect(
 
     monkeypatch.setattr(device, "establish_connection", establish)
     monkeypatch.setattr(
-        device.bluetooth, "async_ble_device_from_address", Mock(return_value=Mock())
+        device,
+        "async_mesh_proxy_candidates",
+        Mock(return_value=(device.MeshProxyCandidate(light.address, Mock()),)),
     )
 
     connecting = asyncio.create_task(light._async_connect())
@@ -247,6 +249,409 @@ async def test_async_stop_cannot_lose_race_with_inflight_connect(
 
     assert light._client is None
     assert light._proxy is None
+    client.disconnect.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_connect_uses_crypto_resolved_alternate_without_changing_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A random transport address never changes stable entity/device identity."""
+    light = make_light(
+        monkeypatch,
+        transport_address="22:22:22:22:22:22",
+    )
+    alternate = "11:22:33:44:55:66"
+    ble_device = Mock(name="manager-selected device")
+    candidate = device.MeshProxyCandidate(alternate, ble_device)
+    resolve = Mock(return_value=(candidate,))
+    monkeypatch.setattr(device, "async_mesh_proxy_candidates", resolve)
+    client = Mock(is_connected=True)
+    client.disconnect = AsyncMock()
+    establish = AsyncMock(return_value=client)
+    monkeypatch.setattr(device, "establish_connection", establish)
+    proxy = Mock()
+    proxy.start = AsyncMock()
+    proxy.stop = AsyncMock()
+    monkeypatch.setattr(device, "ProxyClient", Mock(return_value=proxy))
+    light._async_refresh_state = AsyncMock()
+    light._async_refresh_diagnostics = AsyncMock()
+
+    await light._async_connect()
+
+    assert light.address == "AA:BB:CC:DD:EE:FF"
+    assert light.using_alternate_address
+    assert light._client is client
+    assert light._proxy is proxy
+    resolve.assert_called_once_with(
+        light.hass,
+        light.address,
+        net_key=b"\x01" * 16,
+        unicast_address=2,
+        transport_address="22:22:22:22:22:22",
+    )
+    assert establish.await_args.args[:3] == (
+        device.BleakClient,
+        ble_device,
+        "Test light",
+    )
+    proxy.start.assert_awaited_once_with(subscribe_addresses=[2])
+
+
+@pytest.mark.asyncio
+async def test_not_provisioned_and_recovery_callbacks_are_episode_deduplicated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repairs callbacks fire once on loss and once after proven recovery."""
+    lost = Mock()
+    recovered = Mock()
+    light = make_light(
+        monkeypatch,
+        on_not_provisioned=lost,
+        on_provisioned=recovered,
+    )
+    for _ in range(2):
+        light._notify_not_provisioned()
+    lost.assert_called_once_with()
+    recovered.assert_not_called()
+
+    light._notify_provisioned()
+
+    recovered.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_bare_proxy_does_not_report_recovery_until_primary_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A GATT Proxy handshake cannot clear a Repair without node traffic."""
+    recovered = Mock()
+    light = make_light(
+        monkeypatch,
+        profile=ACE_25X_PROFILE,
+        on_provisioned=recovered,
+    )
+    candidate = device.MeshProxyCandidate(light.address, Mock())
+    monkeypatch.setattr(
+        device, "async_mesh_proxy_candidates", Mock(return_value=(candidate,))
+    )
+    client = Mock(is_connected=True, disconnect=AsyncMock())
+    monkeypatch.setattr(
+        device, "_async_establish_candidate", AsyncMock(return_value=client)
+    )
+    proxy = Mock(start=AsyncMock(), stop=AsyncMock())
+    monkeypatch.setattr(device, "ProxyClient", Mock(return_value=proxy))
+    light._async_refresh_state = AsyncMock(return_value=False)
+    light._async_refresh_diagnostics = AsyncMock()
+
+    await light._async_connect()
+
+    recovered.assert_not_called()
+    assert light.connected
+    assert not light.available
+
+    light._on_access_message(access_message(fan_report(telink.FanMode.SMART)))
+    recovered.assert_not_called()
+
+    status = access_message(as_report(telink.cct(4300, 250), on=True))
+    light._on_access_message(status)
+    light._on_access_message(status)
+
+    recovered.assert_called_once_with()
+    assert light.available
+
+
+@pytest.mark.asyncio
+async def test_cached_provisioning_advert_with_fresh_proxy_gatt_does_not_report_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale provisioning page cannot open a Repair for a live Proxy bearer."""
+    lost = Mock()
+    light = make_light(monkeypatch, on_not_provisioned=lost)
+    ble_device = Mock()
+    monkeypatch.setattr(
+        device.bluetooth,
+        "async_ble_device_from_address",
+        Mock(return_value=ble_device),
+    )
+    monkeypatch.setattr(
+        device.bluetooth,
+        "async_last_service_info",
+        Mock(
+            return_value=SimpleNamespace(
+                address=light.address,
+                service_data={device.MESH_PROVISIONING_SERVICE: b"\x00"},
+                time=1.0,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        device.bluetooth,
+        "async_discovered_service_info",
+        Mock(return_value=()),
+    )
+
+    proxy_service = object()
+    proxy_characteristic = object()
+    services = Mock()
+    services.get_service.side_effect = lambda uuid: (
+        proxy_service if uuid == device.MESH_PROXY_SERVICE else None
+    )
+    services.get_characteristic.side_effect = lambda uuid: (
+        proxy_characteristic
+        if uuid in {device.PROXY_DATA_IN, device.PROXY_DATA_OUT}
+        else None
+    )
+    client = Mock(is_connected=True, services=services, disconnect=AsyncMock())
+    monkeypatch.setattr(device, "establish_connection", AsyncMock(return_value=client))
+    proxy = Mock(start=AsyncMock(), stop=AsyncMock())
+    monkeypatch.setattr(device, "ProxyClient", Mock(return_value=proxy))
+    light._async_refresh_state = AsyncMock()
+    light._async_refresh_diagnostics = AsyncMock()
+
+    await light._async_connect()
+
+    lost.assert_not_called()
+    assert light.connected
+
+
+@pytest.mark.asyncio
+async def test_live_provisioning_gatt_overrides_additive_proxy_advert_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fresh GATT truth reports reset despite stale matching proxy service data."""
+    lost = Mock()
+    light = make_light(monkeypatch, on_not_provisioned=lost)
+    keys = device.network.NetworkKeys.derive(b"\x01" * 16)
+    additive_info = SimpleNamespace(
+        address=light.address,
+        service_data={
+            device.MESH_PROVISIONING_SERVICE: b"\x00",
+            device.MESH_PROXY_SERVICE: b"\x00" + keys.network_id,
+        },
+        time=1.0,
+    )
+    ble_device = Mock()
+    monkeypatch.setattr(
+        device.bluetooth,
+        "async_ble_device_from_address",
+        Mock(return_value=ble_device),
+    )
+    monkeypatch.setattr(
+        device.bluetooth,
+        "async_last_service_info",
+        Mock(return_value=additive_info),
+    )
+    monkeypatch.setattr(
+        device.bluetooth,
+        "async_discovered_service_info",
+        Mock(return_value=()),
+    )
+
+    provisioning_service = object()
+    provisioning_characteristic = object()
+    services = Mock()
+    services.get_service.side_effect = lambda uuid: (
+        provisioning_service if uuid == device.MESH_PROVISIONING_SERVICE else None
+    )
+    services.get_characteristic.side_effect = lambda uuid: (
+        provisioning_characteristic
+        if uuid in {device.PROVISIONING_DATA_IN, device.PROVISIONING_DATA_OUT}
+        else None
+    )
+    client = Mock(is_connected=True, services=services, disconnect=AsyncMock())
+    monkeypatch.setattr(device, "establish_connection", AsyncMock(return_value=client))
+    proxy_factory = Mock()
+    monkeypatch.setattr(device, "ProxyClient", proxy_factory)
+
+    with pytest.raises(device.AmaranNotProvisionedError):
+        await light._async_connect()
+
+    lost.assert_called_once_with()
+    client.disconnect.assert_awaited_once_with()
+    proxy_factory.assert_not_called()
+    assert not light.connected
+
+
+@pytest.mark.asyncio
+async def test_persisted_alternate_with_live_provisioning_gatt_reports_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reset after address rotation still opens one actionable Repair."""
+    alternate = "11:22:33:44:55:66"
+    lost = Mock()
+    light = make_light(
+        monkeypatch,
+        transport_address=alternate,
+        on_not_provisioned=lost,
+    )
+    candidate = device.MeshProxyCandidate(alternate, Mock())
+    resolve = Mock(return_value=(candidate,))
+    monkeypatch.setattr(device, "async_mesh_proxy_candidates", resolve)
+
+    provisioning_service = object()
+    provisioning_characteristic = object()
+    services = Mock()
+    services.get_service.side_effect = lambda uuid: (
+        provisioning_service if uuid == device.MESH_PROVISIONING_SERVICE else None
+    )
+    services.get_characteristic.side_effect = lambda uuid: (
+        provisioning_characteristic
+        if uuid in {device.PROVISIONING_DATA_IN, device.PROVISIONING_DATA_OUT}
+        else None
+    )
+    client = Mock(is_connected=True, services=services, disconnect=AsyncMock())
+    monkeypatch.setattr(
+        device,
+        "_async_establish_candidate",
+        AsyncMock(return_value=client),
+    )
+    proxy_factory = Mock()
+    monkeypatch.setattr(device, "ProxyClient", proxy_factory)
+
+    with pytest.raises(device.AmaranNotProvisionedError):
+        await light._async_connect()
+
+    lost.assert_called_once_with()
+    client.disconnect.assert_awaited_once_with()
+    proxy_factory.assert_not_called()
+    resolve.assert_called_once_with(
+        light.hass,
+        light.address,
+        net_key=b"\x01" * 16,
+        unicast_address=2,
+        transport_address=alternate,
+    )
+
+
+@pytest.mark.asyncio
+async def test_configure_stored_node_falls_back_to_crypto_resolved_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Post-provision recovery is not stranded on a stale stable address."""
+    stable = device.MeshProxyCandidate("AA:BB:CC:DD:EE:FF", Mock())
+    alternate = device.MeshProxyCandidate("11:22:33:44:55:66", Mock())
+    resolve = Mock(return_value=(stable, alternate))
+    monkeypatch.setattr(device, "async_mesh_proxy_candidates", resolve)
+    client = Mock(disconnect=AsyncMock())
+    establish = AsyncMock(side_effect=[device.BleakError("stale"), client])
+    monkeypatch.setattr(device, "_async_establish_candidate", establish)
+    monkeypatch.setattr(device, "_sequence_store", lambda *_args: FakeStore(None))
+    configure = AsyncMock(return_value=37)
+    monkeypatch.setattr(device, "async_configure_node", configure)
+
+    result = await device.async_configure_stored_node(
+        object(),
+        stable.address,
+        "Test light",
+        net_key=b"\x01" * 16,
+        app_key=b"\x02" * 16,
+        device_key=b"\x03" * 16,
+        unicast_address=2,
+        local_address=1,
+        iv_index=7,
+        sequence=11,
+        sequence_store_id="stable-store",
+        transport_address=alternate.address,
+    )
+
+    assert result == 37
+    assert [await_call.args[1] for await_call in establish.await_args_list] == [
+        stable,
+        alternate,
+    ]
+    configure.assert_awaited_once()
+    client.disconnect.assert_awaited_once_with()
+    resolve.assert_called_once_with(
+        ANY,
+        stable.address,
+        net_key=b"\x01" * 16,
+        unicast_address=2,
+        transport_address=alternate.address,
+    )
+
+
+@pytest.mark.asyncio
+async def test_configure_stored_node_reports_fresh_provisioning_bearer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Post-provision configuration recognizes an intervening factory reset."""
+    candidate = device.MeshProxyCandidate("AA:BB:CC:DD:EE:FF", Mock())
+    monkeypatch.setattr(
+        device, "async_mesh_proxy_candidates", Mock(return_value=(candidate,))
+    )
+    provisioning_service = object()
+    provisioning_characteristic = object()
+    services = Mock()
+    services.get_service.side_effect = lambda uuid: (
+        provisioning_service if uuid == device.MESH_PROVISIONING_SERVICE else None
+    )
+    services.get_characteristic.side_effect = lambda uuid: (
+        provisioning_characteristic
+        if uuid in {device.PROVISIONING_DATA_IN, device.PROVISIONING_DATA_OUT}
+        else None
+    )
+    client = Mock(services=services, disconnect=AsyncMock())
+    monkeypatch.setattr(
+        device, "_async_establish_candidate", AsyncMock(return_value=client)
+    )
+    monkeypatch.setattr(device, "_sequence_store", lambda *_args: FakeStore(None))
+    configure = AsyncMock()
+    monkeypatch.setattr(device, "async_configure_node", configure)
+
+    with pytest.raises(device.AmaranNotProvisionedError):
+        await device.async_configure_stored_node(
+            object(),
+            candidate.address,
+            "Test light",
+            net_key=b"\x01" * 16,
+            app_key=b"\x02" * 16,
+            device_key=b"\x03" * 16,
+            unicast_address=2,
+            local_address=1,
+            iv_index=0,
+            sequence=0,
+            sequence_store_id="stable-store",
+        )
+
+    configure.assert_not_awaited()
+    client.disconnect.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_release_node_uses_crypto_resolved_alternate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Entry removal can safely hand back a fixture after address rotation."""
+    alternate = device.MeshProxyCandidate("11:22:33:44:55:66", Mock())
+    monkeypatch.setattr(
+        device, "async_mesh_proxy_candidates", Mock(return_value=(alternate,))
+    )
+    client = Mock(is_connected=True, disconnect=AsyncMock())
+    monkeypatch.setattr(
+        device, "_async_establish_candidate", AsyncMock(return_value=client)
+    )
+    monkeypatch.setattr(device, "_sequence_store", lambda *_args: FakeStore(None))
+    proxy = Mock(start=AsyncMock(), stop=AsyncMock())
+    monkeypatch.setattr(device, "ProxyClient", Mock(return_value=proxy))
+    config = Mock(node_reset=AsyncMock(return_value=True))
+    monkeypatch.setattr(device, "ConfigClient", Mock(return_value=config))
+
+    assert await device.async_release_node(
+        object(),
+        "AA:BB:CC:DD:EE:FF",
+        net_key=b"\x01" * 16,
+        app_key=b"\x02" * 16,
+        device_key=b"\x03" * 16,
+        unicast_address=2,
+        local_address=1,
+        iv_index=7,
+        sequence_store_id="stable-store",
+        transport_address=alternate.address,
+    )
+    proxy.start.assert_awaited_once_with(subscribe_addresses=[2])
+    config.node_reset.assert_awaited_once_with()
+    proxy.stop.assert_awaited_once_with()
     client.disconnect.assert_awaited_once_with()
 
 
@@ -311,7 +716,8 @@ async def test_not_provisioned_reconnect_backs_off_and_can_recover(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A stale provisioning advert must not permanently strand a healthy light."""
-    light = make_light(monkeypatch)
+    not_provisioned = Mock()
+    light = make_light(monkeypatch, on_not_provisioned=not_provisioned)
     sleeps: list[int] = []
     attempts = 0
 
@@ -332,6 +738,7 @@ async def test_not_provisioned_reconnect_backs_off_and_can_recover(
     assert attempts == 2
     assert sleeps == [device.RECONNECT_MIN_DELAY, device.RECONNECT_MIN_DELAY * 2]
     assert light._reconnect_delay == device.RECONNECT_MIN_DELAY * 2
+    not_provisioned.assert_called_once_with()
 
 
 @pytest.mark.asyncio

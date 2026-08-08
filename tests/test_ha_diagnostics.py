@@ -7,9 +7,6 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
-
-pytest.importorskip("homeassistant")
-
 from homeassistant.components.diagnostics import REDACTED
 from homeassistant.config_entries import SOURCE_USER, ConfigEntry
 from homeassistant.const import CONF_ADDRESS, CONF_NAME
@@ -25,6 +22,7 @@ from custom_components.amaran_ble.const import (
     CONF_MODEL,
     CONF_NET_KEY,
     CONF_SEQUENCE_STORE_ID,
+    CONF_TRANSPORT_ADDRESS,
     CONF_UNICAST_ADDRESS,
     DOMAIN,
 )
@@ -38,6 +36,7 @@ def _entry() -> ConfigEntry:
         profile=profile,
         connected=True,
         available=True,
+        using_alternate_address=True,
         preferred_gm=1.5,
         available_fan_modes=("manual", "smart"),
         state=telink.LightState(
@@ -119,6 +118,7 @@ def _entry() -> ConfigEntry:
         modified_at=fixed_time,
         data={
             CONF_ADDRESS: "AA:BB:CC:DD:EE:FF",
+            CONF_TRANSPORT_ADDRESS: "11:22:33:44:55:66",
             CONF_NAME: "Secret studio light",
             CONF_NET_KEY: "01" * 16,
             CONF_APP_KEY: "02" * 16,
@@ -160,6 +160,7 @@ async def test_diagnostics_redact_all_mesh_identity_and_sequence_data() -> None:
     assert config["discovery_keys"] == REDACTED
     for key in (
         CONF_ADDRESS,
+        CONF_TRANSPORT_ADDRESS,
         CONF_NAME,
         CONF_NET_KEY,
         CONF_APP_KEY,
@@ -214,6 +215,7 @@ async def test_diagnostics_include_deterministic_profile_and_decoded_states() ->
     runtime = first["runtime"]
     assert runtime["connected"] is True
     assert runtime["available"] is True
+    assert runtime["using_alternate_address"] is True
     assert runtime["preferred_green_magenta"] == 1.5
     assert runtime["available_fan_modes"] == ["manual", "smart"]
     assert runtime["states"]["light"] == {
@@ -248,6 +250,20 @@ async def test_diagnostics_include_deterministic_profile_and_decoded_states() ->
 
     # Home Assistant's diagnostics encoder must be able to serialize everything.
     json.dumps(first, sort_keys=True)
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_report_alternate_transport_without_addresses() -> None:
+    """Random-address recovery is visible without exposing either address."""
+    entry = _entry()
+
+    result = await diagnostics.async_get_config_entry_diagnostics(object(), entry)
+
+    assert result["runtime"]["using_alternate_address"] is True
+    assert result["config_entry"]["data"][CONF_TRANSPORT_ADDRESS] == REDACTED
+    serialized = json.dumps(result, sort_keys=True)
+    assert "AA:BB:CC:DD:EE:FF" not in serialized
+    assert "11:22:33:44:55:66" not in serialized
 
 
 @pytest.mark.asyncio
