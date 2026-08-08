@@ -11,16 +11,20 @@
       },
       "confirm": {
         "title": "Add {name}",
-        "description": "Home Assistant will provision {name} ({address}) into its own private Bluetooth Mesh network.\n\nThis takes the fixture out of any mesh it currently belongs to, so the amaran app will no longer see it until you factory reset the light.",
+        "description": "Home Assistant will provision {name} ({address}) into its own private Bluetooth Mesh network.\n\nThis takes the fixture out of any mesh it currently belongs to, so the amaran app will no longer see it until you factory reset the light. Verify that the address belongs to the intended amaran fixture before continuing.",
         "data": {
-          "supports_color": "Fixture supports full colour (RGB)",
+          "supports_cct": "Fixture has adjustable colour temperature",
+          "supports_color": "Fixture supports full colour (HSI)",
+          "supports_gm": "Fixture supports green/magenta adjustment",
           "min_kelvin": "Minimum colour temperature",
           "max_kelvin": "Maximum colour temperature"
         },
         "data_description": {
-          "supports_color": "Turn this off for bi-colour fixtures such as the Ace 25x, which only adjust white balance. amaran model names ending in 'c' are full colour; those ending in 'x' are bi-colour.",
-          "min_kelvin": "Use your fixture's rated range; you can change this later.",
-          "max_kelvin": "The protocol allows 800 K to 10000 K regardless of what the fixture can render."
+          "supports_cct": "Turn this off for fixed-daylight fixtures. Models ending in 'x' normally support this; models ending in 'd' normally do not.",
+          "supports_color": "Enable this for full-colour fixtures such as models ending in 'c'.",
+          "supports_gm": "Adds a separate G/M slider. Enable it only when the fixture supports tint adjustment in CCT mode.",
+          "min_kelvin": "Use your fixture's rated range; it is ignored when adjustable colour temperature is off.",
+          "max_kelvin": "The protocol carries 800 K to 20000 K; use the fixture's rated maximum."
         }
       }
     },
@@ -28,6 +32,8 @@
       "cannot_connect": "Could not connect to the fixture. Move it closer to a Bluetooth adapter or proxy and try again.",
       "provisioning_failed": "Provisioning failed. Factory reset the fixture and try again.",
       "invalid_range": "The maximum colour temperature must be higher than the minimum.",
+      "gm_requires_cct": "Green/magenta adjustment requires adjustable colour temperature.",
+      "color_requires_cct": "Full-colour control requires adjustable colour temperature.",
       "already_provisioned": "This fixture belongs to another Bluetooth Mesh network, most likely the amaran app's. Factory reset the light and try again."
     },
     "abort": {
@@ -42,19 +48,32 @@
         "title": "Fixture capabilities",
         "description": "These cannot be read over Bluetooth Mesh, so set them to match your fixture.",
         "data": {
-          "supports_color": "Fixture supports full colour (RGB)",
+          "supports_cct": "Fixture has adjustable colour temperature",
+          "supports_color": "Fixture supports full colour (HSI)",
+          "supports_gm": "Fixture supports green/magenta adjustment",
           "min_kelvin": "Minimum colour temperature",
           "max_kelvin": "Maximum colour temperature"
         },
         "data_description": {
-          "supports_color": "Turn this off for bi-colour fixtures such as the Ace 25x, which only adjust white balance.",
-          "min_kelvin": "The warmest-to-coolest range shown in Home Assistant.",
-          "max_kelvin": "The protocol allows 800 K to 10000 K; use your fixture's rated range."
+          "supports_cct": "Turn this off for fixed-daylight fixtures.",
+          "supports_color": "Enable this for full-colour fixtures with HSI control.",
+          "supports_gm": "Adds a separate G/M slider and requires adjustable colour temperature.",
+          "min_kelvin": "The warmest value shown in Home Assistant; ignored when adjustable colour temperature is off.",
+          "max_kelvin": "The coolest value shown in Home Assistant, up to the protocol limit of 20000 K."
         }
       }
     },
     "error": {
-      "invalid_range": "The maximum colour temperature must be higher than the minimum."
+      "invalid_range": "The maximum colour temperature must be higher than the minimum.",
+      "gm_requires_cct": "Green/magenta adjustment requires adjustable colour temperature.",
+      "color_requires_cct": "Full-colour control requires adjustable colour temperature."
+    }
+  },
+  "entity": {
+    "number": {
+      "green_magenta": {
+        "name": "Green/magenta"
+      }
     }
   }
 }

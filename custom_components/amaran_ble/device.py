@@ -122,12 +122,19 @@ class AmaranLight:
         self._client: BleakClient | None = None
         self._proxy: ProxyClient | None = None
         self._connect_lock = asyncio.Lock()
+        # Light and number entities have separate Home Assistant semaphores.
+        # Keep their multi-packet operations (parameters, power, status) from
+        # interleaving at the fixture.
+        self._operation_lock = asyncio.Lock()
         self._closing = False
         self._reconnect_task: asyncio.Task | None = None
         self._poll_task: asyncio.Task | None = None
         self._reconnect_delay = RECONNECT_MIN_DELAY
 
         self._state: telink.LightState | None = None
+        # HSI reports do not carry G/M, so retain the last CCT tint instead of
+        # treating every switch to colour mode as a reset to neutral.
+        self._preferred_gm = 0
         self._state_received = asyncio.Event()
         self._listeners: list[Callable[[], None]] = []
 
@@ -136,6 +143,11 @@ class AmaranLight:
     @property
     def state(self) -> telink.LightState | None:
         return self._state
+
+    @property
+    def preferred_gm(self) -> int:
+        """Return the last known or requested green/magenta adjustment."""
+        return self._preferred_gm
 
     @property
     def available(self) -> bool:
@@ -196,7 +208,67 @@ class AmaranLight:
     ) -> None:
         await self._async_send(telink.hsi(round(hue), round(saturation), intensity))
 
+    async def async_apply_turn_on(
+        self,
+        *,
+        intensity: int,
+        brightness_changed: bool,
+        kelvin: int | None = None,
+        hs_color: tuple[float, float] | None = None,
+    ) -> None:
+        """Apply light parameters, power, and state refresh as one operation."""
+        async with self._operation_lock:
+            state = self._state
+            if hs_color is not None:
+                await self.async_set_hsi(hs_color[0], hs_color[1], intensity)
+            elif kelvin is not None:
+                await self.async_set_cct(kelvin, intensity, self._preferred_gm)
+            elif brightness_changed:
+                await self.async_set_brightness(intensity)
+
+            # Parameter messages do not wake a sleeping fixture. Power on
+            # last so it never flashes at the previous settings.
+            if state is None or not state.on:
+                await self.async_turn_on()
+
+            await self._async_refresh_state()
+
+    async def async_apply_turn_off(self) -> None:
+        """Power down and refresh without interleaving another entity command."""
+        async with self._operation_lock:
+            await self.async_turn_off()
+            await self._async_refresh_state()
+
+    async def async_set_gm(self, gm: int) -> None:
+        """Set G/M in CCT mode, or remember it while the fixture is in HSI."""
+        target = max(-10, min(10, gm))
+        async with self._operation_lock:
+            previous = self._preferred_gm
+            state = self._state
+            if state is None:
+                raise AmaranConnectionError(f"{self.name} has not reported its state")
+            if state.is_hsi:
+                if target != previous:
+                    self._preferred_gm = target
+                    self._notify_listeners()
+                return
+
+            try:
+                await self.async_set_cct(state.kelvin, state.intensity, target)
+                self._preferred_gm = target
+                await self._async_refresh_state()
+            except BaseException:
+                self._preferred_gm = previous
+                raise
+
     async def async_refresh_state(
+        self, attempts: int = 3, timeout: float = 0.7
+    ) -> bool:
+        """Refresh state without crossing another entity operation."""
+        async with self._operation_lock:
+            return await self._async_refresh_state(attempts, timeout)
+
+    async def _async_refresh_state(
         self, attempts: int = 3, timeout: float = 0.7
     ) -> bool:
         """Ask the fixture for its state and wait for the report to arrive.
@@ -293,7 +365,7 @@ class AmaranLight:
 
         # Prime the cached state; without a report the entity stays unavailable.
         with contextlib.suppress(AmaranConnectionError):
-            await self.async_refresh_state()
+            await self._async_refresh_state()
 
     async def _async_disconnect(self) -> None:
         proxy, client = self._proxy, self._client
@@ -336,7 +408,8 @@ class AmaranLight:
             if self._closing:
                 return
             try:
-                await self._async_connect()
+                async with self._operation_lock:
+                    await self._async_connect()
             except AmaranNotProvisionedError:
                 _LOGGER.warning(
                     "%s reports as unprovisioned; it must be re-added to Home "
@@ -419,7 +492,10 @@ class AmaranLight:
         state = telink.decode_status(message.parameters)
         if state is None:
             return
-        changed = state != self._state
+        previous_gm = self._preferred_gm
+        if not state.is_hsi:
+            self._preferred_gm = state.gm
+        changed = state != self._state or self._preferred_gm != previous_gm
         self._state = state
         # Always release refresh waiters -- a report that matches what we
         # already had still proves the fixture answered.

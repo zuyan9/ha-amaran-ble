@@ -46,7 +46,7 @@ from .pending import async_remove_pending
 
 _LOGGER = logging.getLogger(__name__)
 
-PLATFORMS: list[Platform] = [Platform.LIGHT]
+PLATFORMS: list[Platform] = [Platform.LIGHT, Platform.NUMBER]
 
 # Resetting the node on removal is best effort; never let it stall the UI.
 RELEASE_TIMEOUT = 30.0
@@ -56,8 +56,15 @@ type AmaranConfigEntry = ConfigEntry[AmaranLight]
 
 async def async_migrate_entry(hass: HomeAssistant, entry: AmaranConfigEntry) -> bool:
     """Migrate config entries created by the pre-release prototype."""
-    if entry.version > 1 or (entry.version == 1 and entry.minor_version > 2):
+    if entry.version > 1 or (entry.version == 1 and entry.minor_version > 3):
         return False
+
+    # A pre-release 0.3 build briefly used minor version 3 for additive option
+    # keys. The old integration already ignores unknown options, so normalize
+    # it back to 2 and retain safe HACS rollback compatibility.
+    if entry.version == 1 and entry.minor_version == 3:
+        hass.config_entries.async_update_entry(entry, minor_version=2)
+        return True
 
     if entry.version == 1 and entry.minor_version < 2:
         options = dict(entry.options)
@@ -71,6 +78,7 @@ async def async_migrate_entry(hass: HomeAssistant, entry: AmaranConfigEntry) -> 
         ):
             options[CONF_MIN_KELVIN] = DEFAULT_MIN_KELVIN
             options[CONF_MAX_KELVIN] = DEFAULT_MAX_KELVIN
+
         hass.config_entries.async_update_entry(
             entry,
             version=1,

@@ -31,6 +31,7 @@ PROXY_CONFIG_FILTER_STATUS = 0x03
 PROXY_FILTER_ACCEPT_LIST = 0x00
 
 DEFAULT_TTL = 5
+PROXY_START_TIMEOUT = 30.0
 
 
 class ProxyError(Exception):
@@ -113,10 +114,11 @@ class ProxyClient:
         The filter starts empty, so without this the proxy server forwards
         nothing back to us and every status message would be lost.
         """
-        await self._transport.start()
-        # Telink firmware needs a short pause after enabling notifications.
-        await asyncio.sleep(0.5)
-        await self._setup_filter(subscribe_addresses or [])
+        async with asyncio.timeout(PROXY_START_TIMEOUT):
+            await self._transport.start()
+            # Telink firmware needs a short pause after enabling notifications.
+            await asyncio.sleep(0.5)
+            await self._setup_filter(subscribe_addresses or [])
 
     async def stop(self) -> None:
         for task in self._background_tasks:

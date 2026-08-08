@@ -6,10 +6,8 @@ DOMAIN: Final = "amaran_ble"
 
 MANUFACTURER: Final = "amaran"
 
-# Telink Semiconductor, the SoC vendor amaran fixtures use. The company ID
-# only appears in the scan response, which passive-only scanners never see;
-# the address prefix is in every advertisement.
-TELINK_COMPANY_ID: Final = 0x0211
+# The hardware-verified fixture uses this Telink address prefix. It remains
+# visible to passive-only Bluetooth proxies when the advertised name does not.
 TELINK_ADDRESS_PREFIX: Final = "A4:C1:38"
 
 # Config entry data.
@@ -25,12 +23,16 @@ CONF_INITIAL_SEQUENCE: Final = "initial_sequence"
 CONF_NEEDS_CONFIGURATION: Final = "needs_configuration"
 
 # Config entry options.
+CONF_SUPPORTS_CCT: Final = "supports_cct"
 CONF_SUPPORTS_COLOR: Final = "supports_color"
+CONF_SUPPORTS_GM: Final = "supports_gm"
 CONF_MIN_KELVIN: Final = "min_kelvin"
 CONF_MAX_KELVIN: Final = "max_kelvin"
 CONF_TRANSITION_FADE: Final = "transition_fade"
 
+DEFAULT_SUPPORTS_CCT: Final = True
 DEFAULT_SUPPORTS_COLOR: Final = False
+DEFAULT_SUPPORTS_GM: Final = False
 DEFAULT_MIN_KELVIN: Final = 2700
 DEFAULT_MAX_KELVIN: Final = 6500
 

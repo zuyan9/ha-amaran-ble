@@ -35,6 +35,11 @@ SAR_FIRST = 0x01
 SAR_CONTINUATION = 0x02
 SAR_LAST = 0x03
 
+# BlueZ normally bounds D-Bus operations, but broken fixture proxy firmware can
+# leave notification or write calls pending forever. Never let one GATT call
+# stall config-entry setup or unload indefinitely.
+GATT_OPERATION_TIMEOUT = 10.0
+
 
 class MeshGattTransport:
     """Segments outgoing / reassembles incoming Proxy PDUs on a bleak client."""
@@ -66,12 +71,14 @@ class MeshGattTransport:
     SEGMENT_SIZE = 19
 
     async def start(self) -> None:
-        await self._client.start_notify(self._char_out, self._notification_handler)
+        async with asyncio.timeout(GATT_OPERATION_TIMEOUT):
+            await self._client.start_notify(self._char_out, self._notification_handler)
 
     async def stop(self) -> None:
         # Teardown must not mask whatever error prompted it.
         with contextlib.suppress(Exception):
-            await self._client.stop_notify(self._char_out)
+            async with asyncio.timeout(GATT_OPERATION_TIMEOUT):
+                await self._client.stop_notify(self._char_out)
 
     async def send(self, msg_type: int, payload: bytes) -> None:
         """Write one Proxy PDU, segmenting it if it exceeds one write."""
@@ -92,7 +99,8 @@ class MeshGattTransport:
 
     async def _write(self, data: bytes) -> None:
         _LOGGER.debug("TX %s", data.hex())
-        await self._client.write_gatt_char(self._char_in, data, response=False)
+        async with asyncio.timeout(GATT_OPERATION_TIMEOUT):
+            await self._client.write_gatt_char(self._char_in, data, response=False)
 
     def _notification_handler(self, _sender, data: bytearray) -> None:
         _LOGGER.debug("RX %s", bytes(data).hex())

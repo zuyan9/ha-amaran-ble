@@ -22,12 +22,10 @@ CMD_CCT = 0x82
 CMD_ONOFF = 0x8C
 CMD_BRIGHTNESS = 0x8F
 
-# The wire field holds kelvin/10 in 10 bits, so 10000K is the ceiling that
-# round-trips. The reference implementation had a wrap encoding for higher
-# values, but an Ace 25x decodes those to the wrong colour (15000K comes back
-# as 5000K), so we clamp instead.
+# The wire field stores kelvin/10. Values above 10000K wrap through the 10-bit
+# field and set a separate high-range flag; see ``cct`` below.
 MIN_KELVIN = 800
-MAX_KELVIN = 10000
+MAX_KELVIN = 20000
 MAX_INTENSITY = 1000
 
 
@@ -74,8 +72,14 @@ def cct(kelvin: float, intensity: float, gm: float = 0) -> bytes:
 
     low = (value & 0x03) << 62
     high = 0x8200 | ((value >> 2) & 0xFF)
-    low |= tcct << 52
-    high |= (tcct >> 12) & 0xFF
+    if tcct < 1001:
+        low |= tcct << 52
+        high |= (tcct >> 12) & 0xFF
+    else:
+        # The proprietary high-CCT representation wraps 10010..20000K into
+        # the 10-bit field with a +0x18 offset and marks it in bit 42.
+        low |= ((tcct + 0x18) & 0x3FF) << 52
+        low |= 0x0000040000000000
     low |= (gm_flag & 0x01) << 43
     low |= (green & 0x7F) << 45
 

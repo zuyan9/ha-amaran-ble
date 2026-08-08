@@ -22,9 +22,11 @@ from . import AmaranConfigEntry
 from .const import (
     CONF_MAX_KELVIN,
     CONF_MIN_KELVIN,
+    CONF_SUPPORTS_CCT,
     CONF_SUPPORTS_COLOR,
     DEFAULT_MAX_KELVIN,
     DEFAULT_MIN_KELVIN,
+    DEFAULT_SUPPORTS_CCT,
     DEFAULT_SUPPORTS_COLOR,
     DOMAIN,
     MANUFACTURER,
@@ -77,16 +79,23 @@ class AmaranLightEntity(LightEntity):
         )
 
         options = entry.options
+        self._supports_cct = bool(options.get(CONF_SUPPORTS_CCT, DEFAULT_SUPPORTS_CCT))
         supports_color = options.get(CONF_SUPPORTS_COLOR, DEFAULT_SUPPORTS_COLOR)
-        self._attr_supported_color_modes = {ColorMode.COLOR_TEMP}
+        self._min_kelvin = int(options.get(CONF_MIN_KELVIN, DEFAULT_MIN_KELVIN))
+        self._max_kelvin = int(options.get(CONF_MAX_KELVIN, DEFAULT_MAX_KELVIN))
+
+        supported_color_modes: set[ColorMode] = set()
+        if self._supports_cct:
+            supported_color_modes.add(ColorMode.COLOR_TEMP)
         if supports_color:
-            self._attr_supported_color_modes.add(ColorMode.HS)
-        self._attr_min_color_temp_kelvin = int(
-            options.get(CONF_MIN_KELVIN, DEFAULT_MIN_KELVIN)
-        )
-        self._attr_max_color_temp_kelvin = int(
-            options.get(CONF_MAX_KELVIN, DEFAULT_MAX_KELVIN)
-        )
+            supported_color_modes.add(ColorMode.HS)
+        if not supported_color_modes:
+            supported_color_modes.add(ColorMode.BRIGHTNESS)
+        self._attr_supported_color_modes = supported_color_modes
+
+        if self._supports_cct:
+            self._attr_min_color_temp_kelvin = self._min_kelvin
+            self._attr_max_color_temp_kelvin = self._max_kelvin
 
     async def async_added_to_hass(self) -> None:
         self.async_on_remove(self._device.add_listener(self._handle_update))
@@ -116,22 +125,29 @@ class AmaranLightEntity(LightEntity):
             return None
         if state.is_hsi and ColorMode.HS in self._attr_supported_color_modes:
             return ColorMode.HS
-        return ColorMode.COLOR_TEMP
+        if ColorMode.COLOR_TEMP in self._attr_supported_color_modes:
+            return ColorMode.COLOR_TEMP
+        if ColorMode.BRIGHTNESS in self._attr_supported_color_modes:
+            return ColorMode.BRIGHTNESS
+        # An HSI-only profile can boot in the fixture's default CCT mode. Keep
+        # the reported mode inside Home Assistant's advertised mode set.
+        return ColorMode.HS
 
     @property
     def color_temp_kelvin(self) -> int | None:
         state = self._device.state
-        if state is None or state.is_hsi:
+        if state is None or state.is_hsi or not self._supports_cct:
             return None
-        return min(
-            max(state.kelvin, self._attr_min_color_temp_kelvin),
-            self._attr_max_color_temp_kelvin,
-        )
+        return min(max(state.kelvin, self._min_kelvin), self._max_kelvin)
 
     @property
     def hs_color(self) -> tuple[float, float] | None:
         state = self._device.state
-        if state is None or not state.is_hsi:
+        if (
+            state is None
+            or not state.is_hsi
+            or ColorMode.HS not in self._attr_supported_color_modes
+        ):
             return None
         return (float(state.hue), float(state.saturation))
 
@@ -139,7 +155,13 @@ class AmaranLightEntity(LightEntity):
         state = self._device.state
         brightness = kwargs.get(ATTR_BRIGHTNESS)
         color_temp = kwargs.get(ATTR_COLOR_TEMP_KELVIN)
-        hs_color = kwargs.get(ATTR_HS_COLOR)
+        hs_color = (
+            kwargs.get(ATTR_HS_COLOR)
+            if ColorMode.HS in self._attr_supported_color_modes
+            else None
+        )
+        if not self._supports_cct:
+            color_temp = None
 
         if brightness is not None:
             intensity = _to_intensity(brightness)
@@ -149,32 +171,22 @@ class AmaranLightEntity(LightEntity):
             intensity = MAX_INTENSITY
 
         try:
-            # Colour and CCT messages carry intensity, so one message covers
-            # both; a plain brightness change keeps whichever mode is active.
-            if hs_color is not None:
-                await self._device.async_set_hsi(hs_color[0], hs_color[1], intensity)
-            elif color_temp is not None:
+            if color_temp is not None:
                 color_temp = min(
-                    max(color_temp, self._attr_min_color_temp_kelvin),
-                    self._attr_max_color_temp_kelvin,
+                    max(color_temp, self._min_kelvin),
+                    self._max_kelvin,
                 )
-                gm = state.gm if state is not None and not state.is_hsi else 0
-                await self._device.async_set_cct(color_temp, intensity, gm)
-            elif brightness is not None:
-                await self._device.async_set_brightness(intensity)
-
-            # Setting parameters does not wake a sleeping fixture, so power on
-            # last -- that way it never flashes at the previous settings.
-            if state is None or not state.on:
-                await self._device.async_turn_on()
-
-            await self._device.async_refresh_state()
+            await self._device.async_apply_turn_on(
+                intensity=intensity,
+                brightness_changed=brightness is not None,
+                kelvin=color_temp,
+                hs_color=hs_color,
+            )
         except AmaranConnectionError as err:
             raise HomeAssistantError(str(err)) from err
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         try:
-            await self._device.async_turn_off()
-            await self._device.async_refresh_state()
+            await self._device.async_apply_turn_off()
         except AmaranConnectionError as err:
             raise HomeAssistantError(str(err)) from err

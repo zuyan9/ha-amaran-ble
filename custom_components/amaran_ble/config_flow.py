@@ -42,16 +42,19 @@ from .const import (
     CONF_NEEDS_CONFIGURATION,
     CONF_NET_KEY,
     CONF_NUM_ELEMENTS,
+    CONF_SUPPORTS_CCT,
     CONF_SUPPORTS_COLOR,
+    CONF_SUPPORTS_GM,
     CONF_UNICAST_ADDRESS,
     DEFAULT_MAX_KELVIN,
     DEFAULT_MIN_KELVIN,
+    DEFAULT_SUPPORTS_CCT,
     DEFAULT_SUPPORTS_COLOR,
+    DEFAULT_SUPPORTS_GM,
     DOMAIN,
     NODE_ADDRESS,
     PROVISIONER_ADDRESS,
     TELINK_ADDRESS_PREFIX,
-    TELINK_COMPANY_ID,
 )
 from .pending import (
     PendingProvisionError,
@@ -71,17 +74,19 @@ def is_amaran_fixture(info: BluetoothServiceInfoBleak) -> bool:
     passive-only scans that never request one. The primary advertisement
     carries just the mesh service UUID and its service data, so the address is
     the only fixture-specific field guaranteed to be present -- amaran fixtures
-    use Telink's A4:C1:38 prefix. The manufacturer ID is still accepted when an
-    active scan did pick it up.
+    use Telink's A4:C1:38 prefix. Active advertisements are also accepted by
+    their amaran, Aputure, Sidus, or model name so newer fixtures are not tied
+    to one chip-vendor address range. The stock "SLCK" name alone is not a
+    brand signal; unrelated Telink Mesh products use it too.
     """
     if not (
         MESH_PROVISIONING_SERVICE in info.service_data
         or MESH_PROXY_SERVICE in info.service_data
     ):
         return False
-    return (
-        TELINK_COMPANY_ID in info.manufacturer_data
-        or info.address.upper().startswith(TELINK_ADDRESS_PREFIX)
+    name = (info.name or "").casefold()
+    return info.address.upper().startswith(TELINK_ADDRESS_PREFIX) or any(
+        marker in name for marker in ("amaran", "aputure", "sidus", "150c")
     )
 
 
@@ -173,10 +178,21 @@ class AmaranConfigFlow(ConfigFlow, domain=DOMAIN):
         info = self._discovery
 
         if user_input is None:
-            return self._confirm_form(info, {})
+            return self._confirm_form(info, {}, {})
 
-        if user_input[CONF_MIN_KELVIN] >= user_input[CONF_MAX_KELVIN]:
-            return self._confirm_form(info, {CONF_MAX_KELVIN: "invalid_range"})
+        supports_cct = bool(user_input[CONF_SUPPORTS_CCT])
+        if user_input[CONF_SUPPORTS_GM] and not supports_cct:
+            return self._confirm_form(
+                info, {CONF_SUPPORTS_GM: "gm_requires_cct"}, user_input
+            )
+        if user_input[CONF_SUPPORTS_COLOR] and not supports_cct:
+            return self._confirm_form(
+                info, {CONF_SUPPORTS_COLOR: "color_requires_cct"}, user_input
+            )
+        if supports_cct and user_input[CONF_MIN_KELVIN] >= user_input[CONF_MAX_KELVIN]:
+            return self._confirm_form(
+                info, {CONF_MAX_KELVIN: "invalid_range"}, user_input
+            )
 
         try:
             data = await self._async_provision(info)
@@ -186,19 +202,23 @@ class AmaranConfigFlow(ConfigFlow, domain=DOMAIN):
                 info.address,
                 err,
             )
-            return self._confirm_form(info, {"base": "provisioning_failed"})
+            return self._confirm_form(info, {"base": "provisioning_failed"}, user_input)
         except ProvisioningError as err:
             _LOGGER.error("provisioning %s failed: %s", info.address, err)
-            return self._confirm_form(info, {"base": self._failure_reason(info)})
+            return self._confirm_form(
+                info, {"base": self._failure_reason(info)}, user_input
+            )
         except (BleakError, TimeoutError) as err:
             _LOGGER.error("could not reach %s: %s", info.address, err)
-            return self._confirm_form(info, {"base": "cannot_connect"})
+            return self._confirm_form(info, {"base": "cannot_connect"}, user_input)
 
         return self.async_create_entry(
             title=suggested_title(info),
             data=data,
             options={
+                CONF_SUPPORTS_CCT: supports_cct,
                 CONF_SUPPORTS_COLOR: user_input[CONF_SUPPORTS_COLOR],
+                CONF_SUPPORTS_GM: supports_cct and bool(user_input[CONF_SUPPORTS_GM]),
                 CONF_MIN_KELVIN: int(user_input[CONF_MIN_KELVIN]),
                 CONF_MAX_KELVIN: int(user_input[CONF_MAX_KELVIN]),
             },
@@ -221,13 +241,16 @@ class AmaranConfigFlow(ConfigFlow, domain=DOMAIN):
         return "provisioning_failed"
 
     def _confirm_form(
-        self, info: BluetoothServiceInfoBleak, errors: dict[str, str]
+        self,
+        info: BluetoothServiceInfoBleak,
+        errors: dict[str, str],
+        values: dict[str, Any],
     ) -> ConfigFlowResult:
         """Ask for the capabilities that cannot be read over the mesh.
 
-        Bi-colour and full-colour fixtures are indistinguishable on the wire --
-        both accept and echo back hue and saturation -- so the only honest
-        options are to ask or to show a colour wheel that may do nothing.
+        Fixture capabilities are indistinguishable on the wire: lights accept
+        and echo commands for output modes their LEDs may not actually render.
+        Asking keeps unsupported controls out of Home Assistant.
         """
         return self.async_show_form(
             step_id="confirm",
@@ -239,13 +262,24 @@ class AmaranConfigFlow(ConfigFlow, domain=DOMAIN):
             data_schema=vol.Schema(
                 {
                     vol.Required(
-                        CONF_SUPPORTS_COLOR, default=DEFAULT_SUPPORTS_COLOR
+                        CONF_SUPPORTS_CCT,
+                        default=values.get(CONF_SUPPORTS_CCT, DEFAULT_SUPPORTS_CCT),
                     ): selector.BooleanSelector(),
                     vol.Required(
-                        CONF_MIN_KELVIN, default=DEFAULT_MIN_KELVIN
+                        CONF_SUPPORTS_COLOR,
+                        default=values.get(CONF_SUPPORTS_COLOR, DEFAULT_SUPPORTS_COLOR),
+                    ): selector.BooleanSelector(),
+                    vol.Required(
+                        CONF_SUPPORTS_GM,
+                        default=values.get(CONF_SUPPORTS_GM, DEFAULT_SUPPORTS_GM),
+                    ): selector.BooleanSelector(),
+                    vol.Required(
+                        CONF_MIN_KELVIN,
+                        default=values.get(CONF_MIN_KELVIN, DEFAULT_MIN_KELVIN),
                     ): _kelvin_selector(),
                     vol.Required(
-                        CONF_MAX_KELVIN, default=DEFAULT_MAX_KELVIN
+                        CONF_MAX_KELVIN,
+                        default=values.get(CONF_MAX_KELVIN, DEFAULT_MAX_KELVIN),
                     ): _kelvin_selector(),
                 }
             ),
@@ -350,9 +384,30 @@ class AmaranOptionsFlow(OptionsFlow):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         if user_input is not None:
-            if user_input[CONF_MIN_KELVIN] >= user_input[CONF_MAX_KELVIN]:
+            supports_cct = bool(user_input[CONF_SUPPORTS_CCT])
+            if user_input[CONF_SUPPORTS_GM] and not supports_cct:
+                return self._show_form(
+                    user_input, {CONF_SUPPORTS_GM: "gm_requires_cct"}
+                )
+            if user_input[CONF_SUPPORTS_COLOR] and not supports_cct:
+                return self._show_form(
+                    user_input, {CONF_SUPPORTS_COLOR: "color_requires_cct"}
+                )
+            if (
+                supports_cct
+                and user_input[CONF_MIN_KELVIN] >= user_input[CONF_MAX_KELVIN]
+            ):
                 return self._show_form(user_input, {CONF_MAX_KELVIN: "invalid_range"})
-            return self.async_create_entry(data=user_input)
+            return self.async_create_entry(
+                data={
+                    CONF_SUPPORTS_CCT: supports_cct,
+                    CONF_SUPPORTS_COLOR: bool(user_input[CONF_SUPPORTS_COLOR]),
+                    CONF_SUPPORTS_GM: supports_cct
+                    and bool(user_input[CONF_SUPPORTS_GM]),
+                    CONF_MIN_KELVIN: int(user_input[CONF_MIN_KELVIN]),
+                    CONF_MAX_KELVIN: int(user_input[CONF_MAX_KELVIN]),
+                }
+            )
         return self._show_form(dict(self.config_entry.options), {})
 
     def _show_form(
@@ -364,8 +419,16 @@ class AmaranOptionsFlow(OptionsFlow):
             data_schema=vol.Schema(
                 {
                     vol.Required(
+                        CONF_SUPPORTS_CCT,
+                        default=values.get(CONF_SUPPORTS_CCT, DEFAULT_SUPPORTS_CCT),
+                    ): selector.BooleanSelector(),
+                    vol.Required(
                         CONF_SUPPORTS_COLOR,
                         default=values.get(CONF_SUPPORTS_COLOR, DEFAULT_SUPPORTS_COLOR),
+                    ): selector.BooleanSelector(),
+                    vol.Required(
+                        CONF_SUPPORTS_GM,
+                        default=values.get(CONF_SUPPORTS_GM, DEFAULT_SUPPORTS_GM),
                     ): selector.BooleanSelector(),
                     vol.Required(
                         CONF_MIN_KELVIN,

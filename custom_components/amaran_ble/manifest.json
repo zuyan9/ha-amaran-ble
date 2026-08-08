@@ -4,22 +4,10 @@
   "bluetooth": [
     {
       "service_data_uuid": "00001827-0000-1000-8000-00805f9b34fb",
-      "manufacturer_id": 529,
-      "connectable": true
-    },
-    {
-      "service_data_uuid": "00001827-0000-1000-8000-00805f9b34fb",
-      "local_name": "SLCK*",
       "connectable": true
     },
     {
       "service_data_uuid": "00001828-0000-1000-8000-00805f9b34fb",
-      "manufacturer_id": 529,
-      "connectable": true
-    },
-    {
-      "service_data_uuid": "00001828-0000-1000-8000-00805f9b34fb",
-      "local_name": "SLCK*",
       "connectable": true
     }
   ],
@@ -32,5 +20,5 @@
   "issue_tracker": "https://github.com/zuyan9/ha-amaran-ble/issues",
   "loggers": ["custom_components.amaran_ble"],
   "requirements": [],
-  "version": "0.2.0"
+  "version": "0.3.0"
 }

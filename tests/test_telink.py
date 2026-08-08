@@ -19,6 +19,10 @@ from amaranble import telink
         (telink.cct(2700, 1), "f30000000040e1500082"),
         (telink.cct(5600, 800), "ae00000000400123c882"),
         (telink.cct(6500, 1000), "850000000040a128fa82"),
+        (telink.cct(10000, 500), "fe0000000040813e7d82"),
+        (telink.cct(10010, 500), "54000000004411007d82"),
+        (telink.cct(15000, 500), "a30000000044411f7d82"),
+        (telink.cct(20000, 500), "020000000044813e7d82"),
         (telink.hsi(45, 60, 800), "fd0000000000af05c881"),
         (telink.hsi(360, 100, 1000), "c10000000000192dfa81"),
     ],
@@ -47,6 +51,13 @@ def test_decode_cct_status() -> None:
         hue=0,
         saturation=0,
     )
+
+
+@pytest.mark.parametrize("kelvin", [10000, 10010, 15000, 20000])
+def test_decode_high_cct_status(kelvin: int) -> None:
+    state = telink.decode_status(_as_report(telink.cct(kelvin, 500), on=True))
+    assert state is not None
+    assert state.kelvin == kelvin
 
 
 def test_decode_hsi_status() -> None:

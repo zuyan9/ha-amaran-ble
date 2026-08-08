@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from amaranble import gatt
 from amaranble.gatt import (
     SAR_CONTINUATION,
     SAR_FIRST,
@@ -80,3 +81,36 @@ async def test_async_notification_handler_is_scheduled() -> None:
     await transport.start()
     client.notify_callback(None, bytearray([TYPE_NETWORK, 1]))
     await asyncio.wait_for(event.wait(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_write_timeout_prevents_stuck_proxy_setup(monkeypatch) -> None:
+    class HangingClient(FakeClient):
+        async def write_gatt_char(
+            self, char: str, data: bytes, *, response: bool
+        ) -> None:
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(gatt, "GATT_OPERATION_TIMEOUT", 0.01)
+    transport = MeshGattTransport(HangingClient(), "in", "out", lambda *_: None)
+
+    with pytest.raises(TimeoutError):
+        await transport.send(TYPE_NETWORK, b"stuck")
+
+
+@pytest.mark.asyncio
+async def test_notify_operations_are_bounded(monkeypatch) -> None:
+    class HangingNotifyClient(FakeClient):
+        async def start_notify(self, char: str, callback) -> None:
+            await asyncio.Event().wait()
+
+        async def stop_notify(self, char: str) -> None:
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(gatt, "GATT_OPERATION_TIMEOUT", 0.01)
+    transport = MeshGattTransport(HangingNotifyClient(), "in", "out", lambda *_: None)
+
+    with pytest.raises(TimeoutError):
+        await transport.start()
+    # Teardown is best effort and must return after its own timeout.
+    await transport.stop()

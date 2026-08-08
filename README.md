@@ -21,11 +21,28 @@ No amaran account, cloud service, MQTT, or external bridge is required.
 
 ## Features
 
-- Power and brightness control
-- Adjustable colour temperature
+- Power and brightness control, including fixed-daylight fixtures
+- Configurable fixture-specific CCT range (the protocol carries 800–20000 K)
+- Optional green/magenta tint control
 - Hue and saturation control on full-colour fixtures
 - Live state updates and automatic reconnection
 - Setup and capability options through the Home Assistant UI
+
+## Compatibility
+
+The integration uses the same Telink light-control protocol reverse engineered
+by [wesbos/amaran-BLE-control](https://github.com/wesbos/amaran-BLE-control),
+without a hard-coded model allowlist. During setup, choose whether the fixture
+supports CCT, HSI colour, and green/magenta adjustment; fixed-daylight models
+can use a brightness-only profile.
+
+The **Ace 25x** is hardware-tested. The upstream project was developed around
+the **150c** and also controls a **Halo 100x** in a three-light mesh; the Halo
+is reached through another fixture acting as the BLE Mesh proxy. Neither model
+has been verified with this integration's direct provisioning approach. Other
+single-zone Telink-based amaran/Aputure fixtures using opcode `0x26` may work,
+but remain experimental. Effects, pixel/zone control, fans, boost modes, and
+importing an existing Sidus Link mesh are not currently supported.
 
 ## Requirements
 
@@ -50,8 +67,3 @@ No amaran account, cloud service, MQTT, or external bridge is required.
   factory-reset it and try again.
 - **Entity unavailable:** confirm the light is powered on and that the adapter
   or proxy supports active Bluetooth connections.
-
-## Credits
-
-The light-control protocol is based on the reverse engineering in
-[wesbos/amaran-BLE-control](https://github.com/wesbos/amaran-BLE-control).
