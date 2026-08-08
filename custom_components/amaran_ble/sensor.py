@@ -141,7 +141,12 @@ class AmaranBatteryEntity(_AmaranPowerSensor):
     @property
     def native_value(self) -> int | None:
         state = self._device.power_state
-        return None if state is None else state.battery_percent
+        if state is None:
+            return None
+        # The fixture allocates seven bits to this percentage, while the app
+        # renders every value above its highest bucket as a full battery. Keep
+        # the raw value in PowerState diagnostics, but never publish >100% to HA.
+        return min(state.battery_percent, 100)
 
 
 class AmaranRemainingRuntimeEntity(_AmaranPowerSensor):

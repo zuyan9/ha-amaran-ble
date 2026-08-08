@@ -235,6 +235,7 @@ async def test_diagnostics_include_deterministic_profile_and_decoded_states() ->
         "smart",
     ]
     assert runtime["states"]["power"]["data"]["source"] == "external"
+    assert runtime["states"]["power"]["data"]["battery_percent"] == 82
     assert runtime["states"]["advanced_capabilities"]["data"][
         "system_effect_groups"
     ] == [True, False, True, False, False, False, False, False]
@@ -245,3 +246,20 @@ async def test_diagnostics_include_deterministic_profile_and_decoded_states() ->
 
     # Home Assistant's diagnostics encoder must be able to serialize everything.
     json.dumps(first, sort_keys=True)
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_preserve_raw_battery_percentage() -> None:
+    """Diagnostics retain a seven-bit value that the HA sensor caps at 100%."""
+    entry = _entry()
+    entry.runtime_data.power_state = telink.PowerState(
+        source=telink.PowerSource.EXTERNAL,
+        battery_percent=127,
+        runtime_minutes=145,
+        battery_voltage_raw=1480,
+        external_voltage_raw=2400,
+    )
+
+    result = await diagnostics.async_get_config_entry_diagnostics(object(), entry)
+
+    assert result["runtime"]["states"]["power"]["data"]["battery_percent"] == 127
