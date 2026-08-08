@@ -56,6 +56,35 @@ def test_network_rejects_wrong_key_and_tampering() -> None:
         network.decode_network_pdu(keys, 0, tampered)
 
 
+def test_proxy_configuration_matches_mesh_profile_vector() -> None:
+    """Match the Bluetooth Mesh Profile 1.1 Set Filter Type sample."""
+    keys = network.NetworkKeys.derive(bytes.fromhex("d1aafb2a1a3c281cbdb0e960edfad852"))
+
+    encoded = network.encode_network_pdu(
+        keys,
+        iv_index=0x12345678,
+        ctl=1,
+        ttl=0,
+        seq=1,
+        src=1,
+        dst=network.UNASSIGNED_ADDRESS,
+        transport_pdu=bytes.fromhex("0000"),
+        proxy_config=True,
+    )
+
+    assert encoded.hex() == "10386bd60efbbb8b8c28512e792d3711f4b526"
+    assert network.decode_network_pdu(
+        keys, 0x12345678, encoded, proxy_config=True
+    ) == network.NetworkMessage(
+        ctl=1,
+        ttl=0,
+        seq=1,
+        src=1,
+        dst=network.UNASSIGNED_ADDRESS,
+        transport_pdu=bytes.fromhex("0000"),
+    )
+
+
 @pytest.mark.parametrize("device_key", [False, True])
 def test_upper_transport_round_trip(device_key: bool) -> None:
     access = bytes.fromhex("268d00000000000000018c")

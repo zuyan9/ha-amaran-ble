@@ -64,6 +64,25 @@ async def test_legacy_store_migration_adds_safety_block() -> None:
 
 
 @pytest.mark.asyncio
+async def test_config_entry_sequence_takes_precedence_over_older_store() -> None:
+    saved: list[dict[str, int]] = []
+
+    async def save(data: dict[str, int]) -> None:
+        saved.append(data)
+
+    reservation = SequenceReservation.create(
+        {"reserved_until": 8, "sequence": 8},
+        save,
+        block_size=4,
+        minimum_sequence=42,
+    )
+
+    assert reservation.next_sequence == 42
+    await reservation.ensure_reserved(42)
+    assert saved == [{"reserved_until": 46, "sequence": 46}]
+
+
+@pytest.mark.asyncio
 async def test_new_block_is_persisted_before_use() -> None:
     saved: list[dict[str, int]] = []
 

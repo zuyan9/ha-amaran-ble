@@ -52,9 +52,9 @@ class SequenceReservation:
             raise ValueError("block_size must be positive")
 
         if "reserved_until" in stored:
-            next_sequence = int(stored["reserved_until"])
+            next_sequence = max(int(stored["reserved_until"]), minimum_sequence)
         elif "sequence" in stored:
-            next_sequence = int(stored["sequence"]) + block_size
+            next_sequence = max(int(stored["sequence"]) + block_size, minimum_sequence)
         else:
             # Configuration immediately after provisioning uses the beginning
             # of the sequence space before a config entry (and its Store key)

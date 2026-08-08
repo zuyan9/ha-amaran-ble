@@ -7,7 +7,12 @@ import asyncio
 import pytest
 from amaranble import crypto, network
 from amaranble.gatt import TYPE_NETWORK
-from amaranble.proxy import AccessMessage, ProxyClient
+from amaranble.proxy import (
+    PROXY_CONFIG_ADD_ADDRESSES,
+    PROXY_CONFIG_SET_FILTER_TYPE,
+    AccessMessage,
+    ProxyClient,
+)
 from amaranble.sequence import SequenceReservation
 
 NET_KEY = bytes.fromhex("f7a2a44f8e8a8029064f173ddc1e2b00")
@@ -27,6 +32,43 @@ class RecordingTransport:
 
     async def stop(self) -> None:
         return None
+
+
+@pytest.mark.asyncio
+async def test_proxy_filter_observes_telink_settling_delays(monkeypatch) -> None:
+    proxy = ProxyClient(
+        NoopClient(),
+        net_key=NET_KEY,
+        app_key=APP_KEY,
+        device_keys={},
+    )
+    events: list[tuple[str, float | int]] = []
+
+    class StartTransport:
+        async def start(self) -> None:
+            events.append(("start", 0))
+
+    async def sleep(delay: float) -> None:
+        events.append(("sleep", delay))
+
+    async def send_proxy_config(opcode: int, _params: bytes) -> None:
+        events.append(("send", opcode))
+        assert proxy._filter_status is not None
+        proxy._filter_status.set_result(None)
+
+    proxy._transport = StartTransport()  # type: ignore[assignment]
+    proxy._send_proxy_config = send_proxy_config  # type: ignore[method-assign]
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+
+    await proxy.start([2])
+
+    assert events == [
+        ("start", 0),
+        ("sleep", 0.5),
+        ("send", PROXY_CONFIG_SET_FILTER_TYPE),
+        ("send", PROXY_CONFIG_ADD_ADDRESSES),
+        ("sleep", 0.3),
+    ]
 
 
 @pytest.mark.asyncio

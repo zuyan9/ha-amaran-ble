@@ -114,7 +114,8 @@ class ProxyClient:
         nothing back to us and every status message would be lost.
         """
         await self._transport.start()
-        await asyncio.sleep(0.3)
+        # Telink firmware needs a short pause after enabling notifications.
+        await asyncio.sleep(0.5)
         await self._setup_filter(subscribe_addresses or [])
 
     async def stop(self) -> None:
@@ -325,6 +326,9 @@ class ProxyClient:
         except TimeoutError:
             _LOGGER.debug("no filter status after Add Addresses; continuing")
         self._filter_status = None
+        # Match the fixture's own control stack: it allows the updated filter
+        # to settle before sending the first network message.
+        await asyncio.sleep(0.3)
 
     async def _send_proxy_config(self, opcode: int, params: bytes) -> None:
         seq = await self._next_seq()
