@@ -93,6 +93,6 @@ class AmaranGreenMagentaEntity(NumberEntity):
 
     async def async_set_native_value(self, value: float) -> None:
         try:
-            await self._device.async_set_gm(round(value))
+            await self._device.async_set_gm(value)
         except AmaranConnectionError as err:
             raise HomeAssistantError(str(err)) from err

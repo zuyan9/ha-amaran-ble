@@ -20,5 +20,5 @@
   "issue_tracker": "https://github.com/zuyan9/ha-amaran-ble/issues",
   "loggers": ["custom_components.amaran_ble"],
   "requirements": [],
-  "version": "0.3.0"
+  "version": "0.3.1"
 }

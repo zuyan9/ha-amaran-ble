@@ -31,7 +31,10 @@ PROXY_CONFIG_FILTER_STATUS = 0x03
 PROXY_FILTER_ACCEPT_LIST = 0x00
 
 DEFAULT_TTL = 5
-PROXY_START_TIMEOUT = 30.0
+# The nested GATT limits plus Telink settle/status phases total just under 35s
+# in the worst allowed case. Leave headroom for the first durable sequence
+# reservation while still bounding config-entry setup.
+PROXY_START_TIMEOUT = 45.0
 
 
 class ProxyError(Exception):
@@ -47,6 +50,16 @@ class AccessMessage:
     opcode: int
     parameters: bytes
     device_key: bool
+
+
+@dataclass
+class _PendingSegmentAck:
+    """Correlation state for one outbound segmented transaction."""
+
+    future: asyncio.Future[network.SegmentAck]
+    dst: int
+    segment_count: int
+    acknowledged: int = 0
 
 
 class ProxyClient:
@@ -65,6 +78,8 @@ class ProxyClient:
         on_message: Callable[[AccessMessage], None] | None = None,
         on_sequence: Callable[[int], None] | None = None,
         before_sequence: Callable[[int], Awaitable[None]] | None = None,
+        replay_list: dict[int, int] | None = None,
+        reassembler: network.SegmentReassembler | None = None,
     ) -> None:
         self._keys = NetworkKeys.derive(net_key)
         self._app_key = app_key
@@ -80,15 +95,23 @@ class ProxyClient:
         self._transport = MeshGattTransport(
             client, PROXY_DATA_IN, PROXY_DATA_OUT, self._on_proxy_pdu
         )
-        self._reassembler = network.SegmentReassembler()
+        # Runtime owners can retain these across BLE reconnects. Both are
+        # scoped to one NetKey and IV Index and must be replaced if either
+        # changes.
+        self._reassembler = (
+            reassembler if reassembler is not None else network.SegmentReassembler()
+        )
         self._send_lock = asyncio.Lock()
         self._sequence_lock = asyncio.Lock()
         self._filter_status: asyncio.Future[None] | None = None
-        self._pending_ack: dict[int, asyncio.Future[network.SegmentAck]] = {}
+        self._pending_ack: dict[int, _PendingSegmentAck] = {}
         self._responses: list[
             tuple[Callable[[AccessMessage], bool], asyncio.Future]
         ] = []
         self._background_tasks: set[asyncio.Task[None]] = set()
+        # The fixture and provisioner use one IV Index for the lifetime of this
+        # private mesh. Keep an in-session Replay Protection List by source.
+        self._replay_list = replay_list if replay_list is not None else {}
 
     @property
     def sequence(self) -> int:
@@ -114,11 +137,19 @@ class ProxyClient:
         The filter starts empty, so without this the proxy server forwards
         nothing back to us and every status message would be lost.
         """
-        async with asyncio.timeout(PROXY_START_TIMEOUT):
-            await self._transport.start()
-            # Telink firmware needs a short pause after enabling notifications.
-            await asyncio.sleep(0.5)
-            await self._setup_filter(subscribe_addresses or [])
+        try:
+            async with asyncio.timeout(PROXY_START_TIMEOUT):
+                await self._transport.start()
+                # Telink firmware needs a short pause after enabling notifications.
+                await asyncio.sleep(0.5)
+                await self._setup_filter(subscribe_addresses or [])
+        except BaseException:
+            # Notification setup can succeed before a later filter operation
+            # fails or the caller is cancelled. Always unwind that partial
+            # start, while preserving the original exception/cancellation.
+            with contextlib.suppress(Exception):
+                await self.stop()
+            raise
 
     async def stop(self) -> None:
         for task in self._background_tasks:
@@ -225,7 +256,8 @@ class ProxyClient:
 
         loop = asyncio.get_running_loop()
         ack_future: asyncio.Future[network.SegmentAck] = loop.create_future()
-        self._pending_ack[seq_zero] = ack_future
+        pending_ack = _PendingSegmentAck(ack_future, dst, len(segments))
+        self._pending_ack[seq_zero] = pending_ack
         try:
             outstanding = set(range(len(segments)))
             for attempt in range(4):
@@ -253,17 +285,22 @@ class ProxyClient:
                     return
                 try:
                     ack = await asyncio.wait_for(
-                        asyncio.shield(ack_future), timeout=1.5
+                        asyncio.shield(pending_ack.future), timeout=1.5
                     )
                 except TimeoutError:
                     continue
+                if ack.block_ack == 0:
+                    raise ProxyError(
+                        f"segmented message to {dst:#06x} was canceled by receiver"
+                    )
                 outstanding = {
-                    i for i in range(len(segments)) if not ack.block_ack & (1 << i)
+                    i
+                    for i in range(len(segments))
+                    if not pending_ack.acknowledged & (1 << i)
                 }
                 if not outstanding:
                     return
-                ack_future = loop.create_future()
-                self._pending_ack[seq_zero] = ack_future
+                pending_ack.future = loop.create_future()
             raise ProxyError(f"segmented message to {dst:#06x} was not acknowledged")
         finally:
             self._pending_ack.pop(seq_zero, None)
@@ -364,11 +401,21 @@ class ProxyClient:
         message = network.decode_network_pdu(
             self._keys, self._iv_index, payload, proxy_config=True
         )
-        opcode = message.transport_pdu[0] & 0x7F
-        if opcode == PROXY_CONFIG_FILTER_STATUS:
-            _LOGGER.debug("proxy filter status: %s", message.transport_pdu[1:].hex())
-            if self._filter_status and not self._filter_status.done():
-                self._filter_status.set_result(None)
+        if self._is_replay(message.src, message.seq):
+            return
+        # Filter Status is exactly opcode, filter type and two-byte list size.
+        # Do not mask RFU opcode bits: 0x83 is not Filter Status. This client
+        # installs an accept-list, so any other filter type is also unsolicited.
+        if (
+            len(message.transport_pdu) != 4
+            or message.transport_pdu[0] != PROXY_CONFIG_FILTER_STATUS
+            or message.transport_pdu[1] != PROXY_FILTER_ACCEPT_LIST
+        ):
+            return
+        self._remember_sequence(message.src, message.seq)
+        _LOGGER.debug("proxy filter status: %s", message.transport_pdu[1:].hex())
+        if self._filter_status and not self._filter_status.done():
+            self._filter_status.set_result(None)
 
     def _handle_network(self, payload: bytes) -> None:
         message = network.decode_network_pdu(self._keys, self._iv_index, payload)
@@ -380,44 +427,113 @@ class ProxyClient:
             return
 
         if message.ctl:
+            if self._is_replay(message.src, message.seq):
+                return
             opcode = lower[0] & 0x7F
             if opcode == network.CONTROL_OPCODE_SEGMENT_ACK:
                 ack = network.parse_segment_ack(lower[1:])
-                future = self._pending_ack.get(ack.seq_zero)
-                if future and not future.done():
-                    future.set_result(ack)
+                pending = self._pending_ack.get(ack.seq_zero)
+                if pending is None or pending.future.done():
+                    return
+                if message.dst != self._local_address:
+                    return
+                # Friendship is not configured by this integration, so there
+                # is no trusted Friend address from which an OBO acknowledgment
+                # can be accepted.  Require the target node even when OBO is
+                # set; otherwise any mesh node could spoof transaction success.
+                if message.src != pending.dst:
+                    return
+                valid_bits = (1 << pending.segment_count) - 1
+                if ack.block_ack & ~valid_bits:
+                    return
+                newly_acknowledged = ack.block_ack & ~pending.acknowledged
+                if ack.block_ack != 0 and newly_acknowledged == 0:
+                    return
+                pending.acknowledged |= ack.block_ack
+                self._remember_sequence(message.src, message.seq)
+                pending.future.set_result(ack)
             return
 
         segmented = bool(lower[0] & 0x80)
         if segmented:
-            field = int.from_bytes(lower[1:4], "big")
-            seq_zero = (field >> 10) & 0x1FFF
-            seg_o = (field >> 5) & 0x1F
-            seg_n = field & 0x1F
-            result = self._reassembler.add(message.src, message.seq, lower)
-            if result is None:
-                # The sender waits for an acknowledgment after its final
-                # segment. A partial bitmap tells it exactly what to retry.
-                if seg_o == seg_n and message.dst == self._local_address:
+            segment = network.parse_access_segment(message.seq, lower)
+            completed_ack = self._reassembler.completed_ack(
+                message.src, message.dst, segment.seq_auth
+            )
+            if self._is_replay(message.src, message.seq):
+                if completed_ack is not None and message.dst == self._local_address:
                     self._schedule_segment_ack(
                         message.src,
-                        seq_zero,
-                        self._reassembler.block_ack(message.src, seq_zero),
+                        segment.seq_zero,
+                        completed_ack,
                     )
                 return
-            upper, akf, aid, szmic, seq_auth = result
+
+            result = self._reassembler.add(
+                message.src,
+                message.dst,
+                message.seq,
+                lower,
+                parsed=segment,
+            )
+            if result.already_complete:
+                if message.dst == self._local_address:
+                    self._schedule_segment_ack(
+                        message.src, segment.seq_zero, result.block_ack
+                    )
+                return
+            if result.upper_pdu is None:
+                # The sender waits for an acknowledgment after its final
+                # segment. A partial bitmap tells it exactly what to retry.
+                if (
+                    segment.seg_o == segment.seg_n
+                    and message.dst == self._local_address
+                ):
+                    self._schedule_segment_ack(
+                        message.src,
+                        segment.seq_zero,
+                        result.block_ack,
+                    )
+                return
+            upper = result.upper_pdu
+            last_segment_seq = result.last_segment_seq
+            assert last_segment_seq is not None
             if message.dst == self._local_address:
                 self._schedule_segment_ack(
                     message.src,
-                    seq_zero,
-                    (1 << (seg_n + 1)) - 1,
+                    segment.seq_zero,
+                    result.block_ack,
                 )
+            if self._is_replay(message.src, last_segment_seq):
+                return
+            if self._decrypt_and_dispatch(
+                message,
+                upper,
+                segment.akf,
+                segment.aid,
+                segment.szmic,
+                segment.seq_auth,
+            ):
+                # For a segmented message the RPL stores the SEQ carried by
+                # SegO == SegN, not SeqAuth or whichever segment arrived last.
+                self._remember_sequence(message.src, last_segment_seq)
+            return
         else:
+            if self._is_replay(message.src, message.seq):
+                return
             akf = (lower[0] >> 6) & 1
             aid = lower[0] & 0x3F
             upper, szmic, seq_auth = lower[1:], 0, message.seq
 
-        self._decrypt_and_dispatch(message, upper, akf, aid, szmic, seq_auth)
+        if self._decrypt_and_dispatch(message, upper, akf, aid, szmic, seq_auth):
+            self._remember_sequence(message.src, message.seq)
+
+    def _is_replay(self, src: int, seq: int) -> bool:
+        previous = self._replay_list.get(src)
+        return previous is not None and seq <= previous
+
+    def _remember_sequence(self, src: int, seq: int) -> None:
+        self._replay_list[src] = max(seq, self._replay_list.get(src, -1))
 
     def _schedule_segment_ack(self, dst: int, seq_zero: int, block_ack: int) -> None:
         task = asyncio.get_running_loop().create_task(
@@ -460,7 +576,7 @@ class ProxyClient:
         aid: int,
         szmic: int,
         seq_auth: int,
-    ) -> None:
+    ) -> bool:
         candidates: list[tuple[bytes, bool]] = []
         if akf == 0:
             device_key = self._device_keys.get(message.src)
@@ -483,7 +599,10 @@ class ProxyClient:
                 )
             except NetworkDecodeError:
                 continue
-            opcode, parameters = network.decode_opcode(access_pdu)
+            try:
+                opcode, parameters = network.decode_opcode(access_pdu)
+            except NetworkDecodeError:
+                continue
             self._dispatch(
                 AccessMessage(
                     src=message.src,
@@ -493,13 +612,14 @@ class ProxyClient:
                     device_key=is_device_key,
                 )
             )
-            return
+            return True
         _LOGGER.debug(
             "no key decrypted message from %#06x (akf=%d aid=%#04x)",
             message.src,
             akf,
             aid,
         )
+        return False
 
     def _dispatch(self, message: AccessMessage) -> None:
         _LOGGER.debug(

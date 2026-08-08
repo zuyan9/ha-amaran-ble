@@ -20,6 +20,7 @@ CONF_IV_INDEX: Final = "iv_index"
 CONF_NUM_ELEMENTS: Final = "num_elements"
 CONF_MODEL: Final = "model"
 CONF_INITIAL_SEQUENCE: Final = "initial_sequence"
+CONF_SEQUENCE_STORE_ID: Final = "sequence_store_id"
 CONF_NEEDS_CONFIGURATION: Final = "needs_configuration"
 
 # Config entry options.

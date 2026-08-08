@@ -12,6 +12,7 @@ desktop app.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 OPCODE = 0x26
@@ -27,6 +28,11 @@ CMD_BRIGHTNESS = 0x8F
 MIN_KELVIN = 800
 MAX_KELVIN = 20000
 MAX_INTENSITY = 1000
+
+
+def _round_half_up(value: float) -> int:
+    """Match JavaScript Math.round, including exact half ties toward +infinity."""
+    return math.floor(value + 0.5)
 
 
 def _finalize(payload: bytearray) -> bytes:
@@ -51,7 +57,7 @@ def onoff(on: bool) -> bytes:
 
 def brightness(intensity: float) -> bytes:
     """Intensity is 0-1000 (tenths of a percent)."""
-    value = max(0, min(MAX_INTENSITY, round(intensity)))
+    value = max(0, min(MAX_INTENSITY, _round_half_up(intensity)))
     payload = bytearray(10)
     payload[7] = (value & 0x03) << 6
     payload[8] = (value >> 2) & 0xFF
@@ -61,13 +67,13 @@ def brightness(intensity: float) -> bytes:
 
 def cct(kelvin: float, intensity: float, gm: float = 0) -> bytes:
     """Correlated colour temperature plus green/magenta shift (-10..+10)."""
-    value = max(0, min(MAX_INTENSITY, round(intensity)))
+    value = max(0, min(MAX_INTENSITY, _round_half_up(intensity)))
 
     # The wire field is kelvin/10 ("telink CCT"); sending raw kelvin overflows
     # the 10-bit field. Integer-truncate to match the firmware exactly.
     tcct = int((max(MIN_KELVIN, min(MAX_KELVIN, kelvin)) + 5) // 10)
 
-    green = max(0, min(20, round(gm) + 10))  # -10..+10 -> 0..20, neutral 10
+    green = max(0, min(20, _round_half_up(gm) + 10))  # -10..+10 -> 0..20
     gm_flag = 0
 
     low = (value & 0x03) << 62
@@ -91,9 +97,9 @@ def cct(kelvin: float, intensity: float, gm: float = 0) -> bytes:
 
 def hsi(hue: float, saturation: float, intensity: float) -> bytes:
     """Hue 0-360 degrees, saturation 0-100, intensity 0-1000."""
-    value = max(0, min(MAX_INTENSITY, round(intensity)))
-    h = max(0, min(360, round(hue))) & 0x1FF
-    s = max(0, min(100, round(saturation))) & 0x7F
+    value = max(0, min(MAX_INTENSITY, _round_half_up(intensity)))
+    h = max(0, min(360, _round_half_up(hue))) & 0x1FF
+    s = max(0, min(100, _round_half_up(saturation))) & 0x7F
 
     payload = bytearray(10)
     payload[5] = (s & 0x03) << 6

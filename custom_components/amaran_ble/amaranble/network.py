@@ -6,6 +6,8 @@ go into a Proxy PDU. No I/O, so it can be exercised without a fixture present.
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from cryptography.exceptions import InvalidTag
@@ -22,6 +24,9 @@ CONTROL_OPCODE_SEGMENT_ACK = 0x00
 # TransMIC is accounted for.
 UNSEGMENTED_ACCESS_MAX = 11
 SEGMENT_PAYLOAD_SIZE = 12
+SEGMENT_REASSEMBLY_TIMEOUT = 10.0
+MAX_PENDING_REASSEMBLIES = 32
+MAX_COMPLETED_REASSEMBLIES = 64
 
 
 class NetworkDecodeError(Exception):
@@ -102,6 +107,25 @@ def encode_network_pdu(
     proxy_config: bool = False,
 ) -> bytes:
     """Encrypt and obfuscate one network PDU."""
+    if ctl not in (0, 1):
+        raise ValueError("CTL must be 0 or 1")
+    if not 0 <= ttl <= 0x7F:
+        raise ValueError("TTL must fit in 7 bits")
+    if not 0 <= seq <= 0xFFFFFF:
+        raise ValueError("SEQ must fit in 24 bits")
+    if not 0x0001 <= src <= 0x7FFF:
+        raise ValueError("SRC must be a unicast address")
+    if proxy_config:
+        if dst != UNASSIGNED_ADDRESS:
+            raise ValueError("proxy configuration DST must be unassigned")
+    elif dst == UNASSIGNED_ADDRESS:
+        raise ValueError("network DST must not be unassigned")
+    max_transport = 12 if ctl else 16
+    if not 1 <= len(transport_pdu) <= max_transport:
+        raise ValueError(
+            f"transport PDU must contain 1-{max_transport} bytes when CTL={ctl}"
+        )
+
     mic_len = 8 if ctl else 4
     nonce = (
         crypto.proxy_nonce(seq, src, iv_index)
@@ -127,8 +151,10 @@ def decode_network_pdu(
     keys: NetworkKeys, iv_index: int, pdu: bytes, *, proxy_config: bool = False
 ) -> NetworkMessage:
     """Reverse :func:`encode_network_pdu`; raises :class:`NetworkDecodeError`."""
-    if len(pdu) < 14:
-        raise NetworkDecodeError(f"network PDU too short: {pdu.hex()}")
+    if not 14 <= len(pdu) <= 29:
+        raise NetworkDecodeError(f"invalid network PDU length {len(pdu)}")
+    if pdu[0] >> 7 != iv_index & 1:
+        raise NetworkDecodeError("IVI does not match the selected IV Index")
     if pdu[0] & 0x7F != keys.nid:
         raise NetworkDecodeError("NID does not match this network")
 
@@ -140,6 +166,10 @@ def decode_network_pdu(
     ttl = header[0] & 0x7F
     seq = int.from_bytes(header[1:4], "big")
     src = int.from_bytes(header[4:6], "big")
+    if not 0x0001 <= src <= 0x7FFF:
+        raise NetworkDecodeError(f"network SRC is not unicast: {src:#06x}")
+    if ctl and len(pdu) < 18:
+        raise NetworkDecodeError("control network PDU is too short")
 
     mic_len = 8 if ctl else 4
     nonce = (
@@ -154,12 +184,21 @@ def decode_network_pdu(
     except InvalidTag as err:
         raise NetworkDecodeError("network MIC check failed") from err
 
+    if len(plaintext) < 3:
+        raise NetworkDecodeError("network transport PDU is empty")
+    dst = int.from_bytes(plaintext[:2], "big")
+    if proxy_config:
+        if dst != UNASSIGNED_ADDRESS:
+            raise NetworkDecodeError("proxy configuration DST is not unassigned")
+    elif dst == UNASSIGNED_ADDRESS:
+        raise NetworkDecodeError("network DST is unassigned")
+
     return NetworkMessage(
         ctl=ctl,
         ttl=ttl,
         seq=seq,
         src=src,
-        dst=int.from_bytes(plaintext[:2], "big"),
+        dst=dst,
         transport_pdu=plaintext[2:],
     )
 
@@ -219,6 +258,8 @@ def decrypt_access_payload(
 
 
 def build_unsegmented_access(akf: int, aid: int, upper_pdu: bytes) -> bytes:
+    if not 1 <= len(upper_pdu) <= 15:
+        raise ValueError("unsegmented Upper Transport PDU must contain 1-15 bytes")
     return bytes([(akf << 6) | (aid & 0x3F)]) + upper_pdu
 
 
@@ -226,6 +267,8 @@ def build_access_segments(
     akf: int, aid: int, seq_zero: int, upper_pdu: bytes, szmic: int = 0
 ) -> list[bytes]:
     """Split an upper transport PDU into segmented lower transport PDUs."""
+    if not upper_pdu:
+        raise ValueError("segmented Upper Transport PDU must not be empty")
     chunks = [
         upper_pdu[i : i + SEGMENT_PAYLOAD_SIZE]
         for i in range(0, len(upper_pdu), SEGMENT_PAYLOAD_SIZE)
@@ -259,9 +302,11 @@ class SegmentAck:
 
 
 def parse_segment_ack(params: bytes) -> SegmentAck:
-    if len(params) < 6:
-        raise NetworkDecodeError(f"short segment ack: {params.hex()}")
+    if len(params) != 6:
+        raise NetworkDecodeError(f"invalid segment ack length {len(params)}")
     field = int.from_bytes(params[:2], "big")
+    if field & 0x03:
+        raise NetworkDecodeError(f"segment ack has non-zero RFU bits: {params.hex()}")
     return SegmentAck(
         obo=bool(field >> 15),
         seq_zero=(field >> 2) & 0x1FFF,
@@ -269,49 +314,276 @@ def parse_segment_ack(params: bytes) -> SegmentAck:
     )
 
 
-class SegmentReassembler:
-    """Collects incoming segmented access messages keyed by (src, seq_zero)."""
+@dataclass(frozen=True)
+class AccessSegment:
+    """Validated fields from one segmented Lower Transport Access PDU."""
 
-    def __init__(self) -> None:
-        self._pending: dict[tuple[int, int], dict[int, bytes]] = {}
-        self._meta: dict[tuple[int, int], tuple[int, int, int, int]] = {}
+    akf: int
+    aid: int
+    szmic: int
+    seq_zero: int
+    seg_o: int
+    seg_n: int
+    seq_auth: int
+    payload: bytes
+
+
+@dataclass(frozen=True)
+class SegmentAddResult:
+    """Result of adding one segment to a reassembly transaction."""
+
+    segment: AccessSegment
+    block_ack: int
+    upper_pdu: bytes | None = None
+    last_segment_seq: int | None = None
+    already_complete: bool = False
+
+
+@dataclass
+class _PendingSegments:
+    akf: int
+    aid: int
+    szmic: int
+    seg_n: int
+    segments: dict[int, bytes]
+    segment_sequences: dict[int, int]
+    updated_at: float
+
+
+@dataclass(frozen=True)
+class _CompletedSegments:
+    """Replay/acknowledgment state for the latest completed transaction."""
+
+    seq_auth: int
+    acked_segments: int
+    akf: int
+    aid: int
+    szmic: int
+    seg_n: int
+
+
+def parse_access_segment(seq: int, lower_pdu: bytes) -> AccessSegment:
+    """Validate and unpack a segmented Lower Transport Access PDU."""
+    if not 0 <= seq <= 0xFFFFFF:
+        raise NetworkDecodeError(f"invalid segment sequence number {seq}")
+    if len(lower_pdu) < 5:
+        raise NetworkDecodeError(f"short access segment: {lower_pdu.hex()}")
+    if not lower_pdu[0] & 0x80:
+        raise NetworkDecodeError("lower transport PDU is not segmented")
+
+    akf = (lower_pdu[0] >> 6) & 1
+    aid = lower_pdu[0] & 0x3F
+    field = int.from_bytes(lower_pdu[1:4], "big")
+    szmic = (field >> 23) & 1
+    seq_zero = (field >> 10) & 0x1FFF
+    seg_o = (field >> 5) & 0x1F
+    seg_n = field & 0x1F
+    payload = lower_pdu[4:]
+
+    if seg_o > seg_n:
+        raise NetworkDecodeError(f"segment offset {seg_o} exceeds last segment {seg_n}")
+    if len(payload) > SEGMENT_PAYLOAD_SIZE:
+        raise NetworkDecodeError(f"access segment payload is too long: {len(payload)}")
+    if seg_o < seg_n and len(payload) != SEGMENT_PAYLOAD_SIZE:
+        raise NetworkDecodeError(
+            f"non-final access segment has {len(payload)} bytes, expected 12"
+        )
+
+    # SeqAuth is the greatest sequence number no larger than SEQ whose low
+    # 13 bits equal SeqZero. A negative result cannot belong to this IV Index.
+    seq_auth = seq - ((seq - seq_zero) & 0x1FFF)
+    if seq_auth < 0:
+        raise NetworkDecodeError(
+            f"segment SeqZero {seq_zero:#06x} is impossible for sequence {seq:#08x}"
+        )
+
+    return AccessSegment(
+        akf=akf,
+        aid=aid,
+        szmic=szmic,
+        seq_zero=seq_zero,
+        seg_o=seg_o,
+        seg_n=seg_n,
+        seq_auth=seq_auth,
+        payload=payload,
+    )
+
+
+class SegmentReassembler:
+    """Bounded, expiring reassembly keyed by source, destination and SeqAuth."""
+
+    def __init__(
+        self,
+        *,
+        timeout: float = SEGMENT_REASSEMBLY_TIMEOUT,
+        max_pending: int = MAX_PENDING_REASSEMBLIES,
+        max_completed: int = MAX_COMPLETED_REASSEMBLIES,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if timeout <= 0:
+            raise ValueError("reassembly timeout must be positive")
+        if max_pending < 1 or max_completed < 1:
+            raise ValueError("reassembly limits must be positive")
+        self._timeout = timeout
+        self._max_pending = max_pending
+        self._max_completed = max_completed
+        self._clock = clock
+        self._pending: dict[tuple[int, int, int], _PendingSegments] = {}
+        # Mesh Protocol 3.5.3.4 requires the most recent completed SeqAuth and
+        # AckedSegments pair to remain available for repeated segments.  These
+        # records therefore do not expire.  Capacity is fixed: evicting one
+        # would turn a delayed replay into a newly deliverable access message.
+        self._completed: dict[tuple[int, int], _CompletedSegments] = {}
+        # Expiring the SAR payload does not make its SeqAuth reusable. Retain
+        # a watermark for discarded transactions so delayed fragments cannot
+        # resurrect them; only a greater SeqAuth may start a new transaction.
+        self._discarded: dict[tuple[int, int], int] = {}
+
+    def _prune(self, now: float) -> None:
+        cutoff = now - self._timeout
+        for key, pending in list(self._pending.items()):
+            if pending.updated_at <= cutoff:
+                del self._pending[key]
+                src, dst, seq_auth = key
+                pair = (src, dst)
+                self._discarded[pair] = max(seq_auth, self._discarded.get(pair, -1))
+                completed = self._completed.get(pair)
+                if completed is not None and completed.seq_auth <= seq_auth:
+                    del self._completed[pair]
+
+    @staticmethod
+    def _bitmap(segments: dict[int, bytes]) -> int:
+        bitmap = 0
+        for seg_o in segments:
+            bitmap |= 1 << seg_o
+        return bitmap
+
+    def completed_ack(
+        self, src: int, dst: int, seq_auth: int, *, now: float | None = None
+    ) -> int | None:
+        """Return the stored AckedSegments for the latest completed SeqAuth."""
+        current = self._clock() if now is None else now
+        self._prune(current)
+        if self._discarded.get((src, dst), -1) >= seq_auth:
+            return None
+        completed = self._completed.get((src, dst))
+        if completed is None or completed.seq_auth != seq_auth:
+            return None
+        return completed.acked_segments
 
     def add(
-        self, src: int, seq: int, lower_pdu: bytes
-    ) -> tuple[bytes, int, int, int, int] | None:
+        self,
+        src: int,
+        dst: int,
+        seq: int,
+        lower_pdu: bytes,
+        *,
+        parsed: AccessSegment | None = None,
+        now: float | None = None,
+    ) -> SegmentAddResult:
         """Feed one segment.
 
-        Returns ``(upper_pdu, akf, aid, szmic, seq_auth)`` once the message is
-        complete, otherwise ``None``.
+        The result includes the current block-ack bitmap and, once complete,
+        the reassembled Upper Transport PDU and the SEQ of its final segment.
         """
-        akf = (lower_pdu[0] >> 6) & 1
-        aid = lower_pdu[0] & 0x3F
-        field = int.from_bytes(lower_pdu[1:4], "big")
-        szmic = (field >> 23) & 1
-        seq_zero = (field >> 10) & 0x1FFF
-        seg_o = (field >> 5) & 0x1F
-        seg_n = field & 0x1F
+        segment = parsed or parse_access_segment(seq, lower_pdu)
+        current = self._clock() if now is None else now
+        self._prune(current)
+        key = (src, dst, segment.seq_auth)
+        pair = (src, dst)
 
-        key = (src, seq_zero)
-        self._pending.setdefault(key, {})[seg_o] = lower_pdu[4:]
-        # SeqAuth is the sequence number the first segment was sent with; it is
-        # what the upper transport nonce must use, not this segment's own seq.
-        seq_auth = seq - ((seq - seq_zero) & 0x1FFF)
-        self._meta[key] = (akf, aid, szmic, seq_auth)
+        if segment.seq_auth <= self._discarded.get(pair, -1):
+            raise NetworkDecodeError("late segment from discarded transaction")
 
-        segments = self._pending[key]
-        if len(segments) <= seg_n:
-            return None
-        upper = b"".join(segments[i] for i in range(seg_n + 1))
+        completed = self._completed.get(pair)
+        if completed is not None:
+            if segment.seq_auth < completed.seq_auth:
+                raise NetworkDecodeError("stale segmented transaction")
+            if segment.seq_auth == completed.seq_auth:
+                if (
+                    segment.akf != completed.akf
+                    or segment.aid != completed.aid
+                    or segment.szmic != completed.szmic
+                    or segment.seg_n != completed.seg_n
+                ):
+                    raise NetworkDecodeError("completed transaction metadata changed")
+                return SegmentAddResult(
+                    segment=segment,
+                    block_ack=completed.acked_segments,
+                    already_complete=True,
+                )
+
+        pending = self._pending.get(key)
+        if pending is None:
+            # A sender shall not have two segmented transactions to the same
+            # destination in flight. A newer SeqAuth supersedes an abandoned
+            # transaction; an older one is stale and must not replace it.
+            for old_key in list(self._pending):
+                old_src, old_dst, old_seq_auth = old_key
+                if old_src != src or old_dst != dst:
+                    continue
+                if old_seq_auth > segment.seq_auth:
+                    raise NetworkDecodeError("stale segmented transaction")
+                del self._pending[old_key]
+
+            if len(self._pending) >= self._max_pending:
+                raise NetworkDecodeError("segment reassembly capacity exhausted")
+            tracked_pairs = set(self._completed)
+            tracked_pairs.update(self._discarded)
+            tracked_pairs.update((item[0], item[1]) for item in self._pending)
+            if pair not in tracked_pairs and len(tracked_pairs) >= self._max_completed:
+                raise NetworkDecodeError(
+                    "completed transaction tracking capacity exhausted"
+                )
+            pending = _PendingSegments(
+                akf=segment.akf,
+                aid=segment.aid,
+                szmic=segment.szmic,
+                seg_n=segment.seg_n,
+                segments={},
+                segment_sequences={},
+                updated_at=current,
+            )
+            self._pending[key] = pending
+        elif (
+            pending.akf != segment.akf
+            or pending.aid != segment.aid
+            or pending.szmic != segment.szmic
+            or pending.seg_n != segment.seg_n
+        ):
+            raise NetworkDecodeError("inconsistent segmented transaction metadata")
+
+        old_payload = pending.segments.get(segment.seg_o)
+        if old_payload is not None and old_payload != segment.payload:
+            raise NetworkDecodeError("retransmitted segment payload changed")
+        pending.segments[segment.seg_o] = segment.payload
+        pending.segment_sequences[segment.seg_o] = max(
+            seq, pending.segment_sequences.get(segment.seg_o, seq)
+        )
+        pending.updated_at = current
+        block_ack = self._bitmap(pending.segments)
+        full_ack = (1 << (segment.seg_n + 1)) - 1
+        if block_ack != full_ack:
+            return SegmentAddResult(segment=segment, block_ack=block_ack)
+
+        upper = b"".join(pending.segments[i] for i in range(segment.seg_n + 1))
+        last_segment_seq = pending.segment_sequences[segment.seg_n]
         del self._pending[key]
-        del self._meta[key]
-        return upper, akf, aid, szmic, seq_auth
-
-    def block_ack(self, src: int, seq_zero: int) -> int:
-        acc = 0
-        for seg_o in self._pending.get((src, seq_zero), {}):
-            acc |= 1 << seg_o
-        return acc
+        self._discarded.pop(pair, None)
+        self._completed[pair] = _CompletedSegments(
+            seq_auth=segment.seq_auth,
+            acked_segments=full_ack,
+            akf=segment.akf,
+            aid=segment.aid,
+            szmic=segment.szmic,
+            seg_n=segment.seg_n,
+        )
+        return SegmentAddResult(
+            segment=segment,
+            block_ack=full_ack,
+            upper_pdu=upper,
+            last_segment_seq=last_segment_seq,
+        )
 
 
 # ─── Access layer ────────────────────────────────────────────────────────────

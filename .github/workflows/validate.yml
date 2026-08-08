@@ -1,0 +1,44 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: astral-sh/setup-uv@v9.0.0
+      - run: uv python install 3.14
+      - run: uv sync --all-groups --locked --python 3.14
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run pytest -q
+      - run: >-
+          uv run
+          --with homeassistant==2026.8.0
+          --with aiousbwatcher==1.1.2
+          --with serialx==1.8.2
+          python -m pytest -q tests/test_ha_*.py
+      - run: uv run python -m compileall -q custom_components tests
+
+  hassfest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: home-assistant/actions/hassfest@master
+
+  hacs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.2
+      - uses: hacs/action@main
+        with:
+          category: integration

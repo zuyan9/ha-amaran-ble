@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 from collections.abc import Awaitable, Callable
 
 from bleak import BleakClient
@@ -20,7 +21,7 @@ from homeassistant.components import bluetooth
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.storage import Store
 
-from .amaranble import telink
+from .amaranble import network, telink
 from .amaranble.config_client import ConfigClient
 from .amaranble.gatt import MESH_PROVISIONING_SERVICE, MESH_PROXY_SERVICE
 from .amaranble.proxy import AccessMessage, ProxyClient, ProxyError
@@ -37,14 +38,15 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 DISCONNECT_TIMEOUT = 5.0
+MAX_MISSED_POLLS = 3
 
 
-def _sequence_store(hass: HomeAssistant, entry_id: str) -> Store[dict]:
+def _sequence_store(hass: HomeAssistant, sequence_store_id: str) -> Store[dict]:
     """Build the private atomic store used for replay-protection state."""
     return Store(
         hass,
         1,
-        f"{DOMAIN}.{entry_id}",
+        f"{DOMAIN}.{sequence_store_id}",
         private=True,
         atomic_writes=True,
     )
@@ -52,7 +54,7 @@ def _sequence_store(hass: HomeAssistant, entry_id: str) -> Store[dict]:
 
 async def _async_verified_sequence_save(
     hass: HomeAssistant,
-    entry_id: str,
+    sequence_store_id: str,
     store: Store[dict],
     data: dict[str, int],
 ) -> None:
@@ -63,9 +65,60 @@ async def _async_verified_sequence_save(
     to the sequence allocator, which then refuses to transmit from that block.
     """
     await store.async_save(data)
-    persisted = await _sequence_store(hass, entry_id).async_load()
+    persisted = await _sequence_store(hass, sequence_store_id).async_load()
     if persisted != data:
         raise OSError("Bluetooth Mesh sequence reservation was not persisted")
+
+
+def _sequence_high_water(stored: dict | None) -> int | None:
+    """Return the next safe sequence represented by one store generation."""
+    if not stored:
+        return None
+    if "reserved_until" in stored:
+        return int(stored["reserved_until"])
+    if "sequence" in stored:
+        # The oldest store format recorded an in-memory sequence rather than
+        # an exclusive reservation, so retain its one-block migration skip.
+        return int(stored["sequence"]) + SEQUENCE_CHECKPOINT
+    return None
+
+
+async def _async_load_sequence_stores(
+    stable_store: Store[dict], compatibility_store: Store[dict] | None
+) -> dict[str, int]:
+    """Merge stable and rollback-compatible stores conservatively."""
+    stable = await stable_store.async_load()
+    compatibility = (
+        await compatibility_store.async_load() if compatibility_store else None
+    )
+    high_waters = [
+        high_water
+        for stored in (stable, compatibility)
+        if (high_water := _sequence_high_water(stored)) is not None
+    ]
+    if not high_waters:
+        return {}
+    high_water = max(high_waters)
+    return {"reserved_until": high_water, "sequence": high_water}
+
+
+async def _async_save_sequence_stores(
+    hass: HomeAssistant,
+    stable_store_id: str,
+    stable_store: Store[dict],
+    compatibility_store_id: str,
+    compatibility_store: Store[dict] | None,
+    data: dict[str, int],
+) -> None:
+    """Write the high-water mark stable-first, then for rollback safety."""
+    await _async_verified_sequence_save(hass, stable_store_id, stable_store, data)
+    if compatibility_store is not None:
+        await _async_verified_sequence_save(
+            hass,
+            compatibility_store_id,
+            compatibility_store,
+            data,
+        )
 
 
 class AmaranConnectionError(Exception):
@@ -90,10 +143,11 @@ class AmaranLight:
     def __init__(
         self,
         hass: HomeAssistant,
-        entry_id: str,
+        sequence_store_id: str,
         address: str,
         name: str,
         *,
+        compatibility_sequence_store_id: str | None = None,
         net_key: bytes,
         app_key: bytes,
         device_key: bytes,
@@ -106,7 +160,10 @@ class AmaranLight:
         self.address = address
         self.name = name
 
-        self._entry_id = entry_id
+        self._sequence_store_id = sequence_store_id
+        self._compatibility_sequence_store_id = (
+            compatibility_sequence_store_id or sequence_store_id
+        )
         self._net_key = net_key
         self._app_key = app_key
         self._device_key = device_key
@@ -115,9 +172,18 @@ class AmaranLight:
         self._iv_index = iv_index
         self._initial_sequence = initial_sequence
 
-        self._store = _sequence_store(hass, entry_id)
+        self._store = _sequence_store(hass, sequence_store_id)
+        self._compatibility_store = (
+            None
+            if self._compatibility_sequence_store_id == sequence_store_id
+            else _sequence_store(hass, self._compatibility_sequence_store_id)
+        )
         self._sequence = 0
         self._sequence_reservation: SequenceReservation | None = None
+        # These receive-side replay records belong to the NetKey/IV Index, not
+        # to one transient GATT connection. Retain them across BLE reconnects.
+        self._inbound_replay_list: dict[int, int] = {}
+        self._segment_reassembler = network.SegmentReassembler()
 
         self._client: BleakClient | None = None
         self._proxy: ProxyClient | None = None
@@ -129,7 +195,9 @@ class AmaranLight:
         self._closing = False
         self._reconnect_task: asyncio.Task | None = None
         self._poll_task: asyncio.Task | None = None
+        self._proxy_cleanup_tasks: set[asyncio.Task] = set()
         self._reconnect_delay = RECONNECT_MIN_DELAY
+        self._missed_polls = 0
 
         self._state: telink.LightState | None = None
         # HSI reports do not carry G/M, so retain the last CCT tint instead of
@@ -165,7 +233,9 @@ class AmaranLight:
 
     async def async_start(self) -> None:
         """Load persisted state and make the first connection attempt."""
-        stored = await self._store.async_load() or {}
+        stored = await _async_load_sequence_stores(
+            self._store, self._compatibility_store
+        )
         try:
             self._sequence_reservation = SequenceReservation.create(
                 stored,
@@ -184,12 +254,30 @@ class AmaranLight:
 
     async def async_stop(self) -> None:
         self._closing = True
-        for task in (self._reconnect_task, self._poll_task):
-            if task:
+        tasks = [
+            task for task in (self._reconnect_task, self._poll_task) if task is not None
+        ]
+        try:
+            for task in tasks:
                 task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-        await self._async_disconnect()
+            if tasks:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, BaseException) and not isinstance(
+                        result, asyncio.CancelledError
+                    ):
+                        _LOGGER.debug(
+                            "background task for %s stopped with an error: %s",
+                            self.address,
+                            result,
+                        )
+        finally:
+            self._reconnect_task = None
+            self._poll_task = None
+            await self._async_disconnect()
+            cleanup_tasks = list(self._proxy_cleanup_tasks)
+            if cleanup_tasks:
+                await asyncio.gather(*cleanup_tasks, return_exceptions=True)
 
     async def async_turn_on(self) -> None:
         await self._async_send(telink.onoff(True))
@@ -200,13 +288,13 @@ class AmaranLight:
     async def async_set_brightness(self, intensity: int) -> None:
         await self._async_send(telink.brightness(intensity))
 
-    async def async_set_cct(self, kelvin: int, intensity: int, gm: int = 0) -> None:
+    async def async_set_cct(self, kelvin: int, intensity: int, gm: float = 0) -> None:
         await self._async_send(telink.cct(kelvin, intensity, gm))
 
     async def async_set_hsi(
         self, hue: float, saturation: float, intensity: int
     ) -> None:
-        await self._async_send(telink.hsi(round(hue), round(saturation), intensity))
+        await self._async_send(telink.hsi(hue, saturation, intensity))
 
     async def async_apply_turn_on(
         self,
@@ -239,9 +327,11 @@ class AmaranLight:
             await self.async_turn_off()
             await self._async_refresh_state()
 
-    async def async_set_gm(self, gm: int) -> None:
+    async def async_set_gm(self, gm: float) -> None:
         """Set G/M in CCT mode, or remember it while the fixture is in HSI."""
-        target = max(-10, min(10, gm))
+        # Match the protocol's JavaScript-style half-up tie behavior while
+        # keeping the cached Number state equal to what the fixture receives.
+        target = max(-10, min(10, math.floor(gm + 0.5)))
         async with self._operation_lock:
             previous = self._preferred_gm
             state = self._state
@@ -319,38 +409,51 @@ class AmaranLight:
                     f"could not connect to {self.address}: {err}"
                 ) from err
 
-            proxy = ProxyClient(
-                client,
-                net_key=self._net_key,
-                app_key=self._app_key,
-                device_keys={self._unicast_address: self._device_key},
-                local_address=self._local_address,
-                iv_index=self._iv_index,
-                sequence=self._sequence,
-                on_message=self._on_access_message,
-                on_sequence=self._on_sequence,
-                before_sequence=self._async_before_sequence,
-            )
             # Install the identity before starting notifications so a
-            # disconnect during proxy-filter setup cannot be mistaken for a
-            # stale callback from an older client.
+            # disconnect -- or even malformed stored key material rejected by
+            # ProxyClient construction -- cannot leak an unowned BLE client or
+            # be mistaken for a stale callback from an older connection.
             self._client = client
+            proxy: ProxyClient | None = None
             try:
+                proxy = ProxyClient(
+                    client,
+                    net_key=self._net_key,
+                    app_key=self._app_key,
+                    device_keys={self._unicast_address: self._device_key},
+                    local_address=self._local_address,
+                    iv_index=self._iv_index,
+                    sequence=self._sequence,
+                    on_message=self._on_access_message,
+                    on_sequence=self._on_sequence,
+                    before_sequence=self._async_before_sequence,
+                    replay_list=self._inbound_replay_list,
+                    reassembler=self._segment_reassembler,
+                )
                 await proxy.start(subscribe_addresses=[self._unicast_address])
-            except (ProxyError, SequenceExhaustedError) as err:
+            except BaseException as err:
                 if self._client is client:
                     self._client = None
-                await self._close_client(client)
-                raise AmaranConnectionError(str(err)) from err
-            except (BleakError, TimeoutError) as err:
-                if self._client is client:
-                    self._client = None
-                await self._close_client(client)
-                if self._looks_unprovisioned():
-                    raise AmaranNotProvisionedError(self.address) from err
-                raise AmaranConnectionError(
-                    f"{self.address} did not expose the mesh proxy service: {err}"
-                ) from err
+                try:
+                    if proxy is not None:
+                        with contextlib.suppress(Exception):
+                            await proxy.stop()
+                finally:
+                    await self._close_client(client)
+                if isinstance(err, asyncio.CancelledError):
+                    raise
+                if isinstance(err, (BleakError, OSError, TimeoutError)):
+                    if self._looks_unprovisioned():
+                        raise AmaranNotProvisionedError(self.address) from err
+                    raise AmaranConnectionError(
+                        f"{self.address} did not expose the mesh proxy service: {err}"
+                    ) from err
+                if isinstance(
+                    err,
+                    (AmaranConnectionError, ProxyError, SequenceExhaustedError),
+                ):
+                    raise AmaranConnectionError(str(err)) from err
+                raise
 
             if self._client is not client or not client.is_connected:
                 with contextlib.suppress(Exception):
@@ -359,8 +462,10 @@ class AmaranLight:
                 raise AmaranConnectionError(
                     f"{self.address} disconnected while setting up its mesh proxy"
                 )
+            assert proxy is not None
             self._proxy = proxy
             self._reconnect_delay = RECONNECT_MIN_DELAY
+            self._missed_polls = 0
             _LOGGER.debug("connected to %s", self.address)
 
         # Prime the cached state; without a report the entity stays unavailable.
@@ -371,11 +476,33 @@ class AmaranLight:
         proxy, client = self._proxy, self._client
         self._proxy = None
         self._client = None
-        if proxy:
+        try:
+            if proxy:
+                with contextlib.suppress(Exception):
+                    await proxy.stop()
+        finally:
+            if client:
+                await self._close_client(client)
+
+    async def _async_drop_failed_connection(self, proxy: ProxyClient) -> None:
+        """Discard a failed link even when bleak omitted its disconnect callback."""
+        if self._proxy is not proxy:
+            return
+        client = self._client
+        self._proxy = None
+        self._client = None
+        self._state = None
+        self._missed_polls = 0
+        self._notify_listeners()
+        try:
             with contextlib.suppress(Exception):
                 await proxy.stop()
-        if client:
-            await self._close_client(client)
+        finally:
+            try:
+                if client:
+                    await self._close_client(client)
+            finally:
+                self._schedule_reconnect()
 
     async def _close_client(self, client: BleakClient) -> None:
         # A disconnect can hang on a pending write; never let that stall unload.
@@ -388,11 +515,37 @@ class AmaranLight:
         if self._closing or self._client is not client:
             return
         _LOGGER.debug("%s disconnected", self.address)
+        proxy = self._proxy
         self._proxy = None
         self._client = None
         self._state = None
+        self._missed_polls = 0
         self._notify_listeners()
+        if proxy is not None:
+            self._schedule_proxy_cleanup(proxy)
         self._schedule_reconnect()
+
+    @callback
+    def _schedule_proxy_cleanup(self, proxy: ProxyClient) -> None:
+        """Drain timers and callback tasks owned by a disconnected proxy."""
+        task = self.hass.async_create_background_task(
+            proxy.stop(), f"{DOMAIN} clean disconnected proxy {self.address}"
+        )
+        self._proxy_cleanup_tasks.add(task)
+
+        def done(completed: asyncio.Task) -> None:
+            self._proxy_cleanup_tasks.discard(completed)
+            if completed.cancelled():
+                return
+            with contextlib.suppress(Exception):
+                if err := completed.exception():
+                    _LOGGER.debug(
+                        "disconnected proxy cleanup for %s failed: %s",
+                        self.address,
+                        err,
+                    )
+
+        task.add_done_callback(done)
 
     @callback
     def _schedule_reconnect(self) -> None:
@@ -411,12 +564,19 @@ class AmaranLight:
                 async with self._operation_lock:
                     await self._async_connect()
             except AmaranNotProvisionedError:
+                # Bluetooth service-data caches can be stale. Back off instead
+                # of permanently terminalizing the entry, so a transient proxy
+                # failure followed by a fresh 0x1828 advertisement self-heals.
+                self._reconnect_delay = min(
+                    self._reconnect_delay * 2, RECONNECT_MAX_DELAY
+                )
                 _LOGGER.warning(
                     "%s reports as unprovisioned; it must be re-added to Home "
-                    "Assistant to be controlled again",
+                    "Assistant if it was factory reset; retrying in %ss in case "
+                    "the Bluetooth advertisement was stale",
                     self.address,
+                    self._reconnect_delay,
                 )
-                return
             except AmaranConnectionError as err:
                 self._reconnect_delay = min(
                     self._reconnect_delay * 2, RECONNECT_MAX_DELAY
@@ -440,9 +600,24 @@ class AmaranLight:
                 self._schedule_reconnect()
                 continue
             try:
-                await self.async_refresh_state(attempts=2)
+                refreshed = await self.async_refresh_state(attempts=2)
             except AmaranConnectionError as err:
                 _LOGGER.debug("status poll for %s failed: %s", self.address, err)
+                continue
+            if refreshed:
+                self._missed_polls = 0
+                continue
+            self._missed_polls += 1
+            if self._missed_polls < MAX_MISSED_POLLS:
+                continue
+            proxy = self._proxy
+            if proxy is not None:
+                _LOGGER.debug(
+                    "%s missed %d consecutive status polls; reconnecting",
+                    self.address,
+                    self._missed_polls,
+                )
+                await self._async_drop_failed_connection(proxy)
 
     def _looks_unprovisioned(self) -> bool:
         """True when the fixture advertises provisioning but not proxy service.
@@ -475,12 +650,12 @@ class AmaranLight:
             await proxy.send_access(
                 self._unicast_address, telink.OPCODE, payload, retries=retries
             )
-        except (
-            BleakError,
-            ProxyError,
-            SequenceExhaustedError,
-            TimeoutError,
-        ) as err:
+        except (BleakError, OSError, TimeoutError) as err:
+            await self._async_drop_failed_connection(proxy)
+            raise AmaranConnectionError(
+                f"failed to send to {self.name}: {err}"
+            ) from err
+        except (ProxyError, SequenceExhaustedError) as err:
             raise AmaranConnectionError(
                 f"failed to send to {self.name}: {err}"
             ) from err
@@ -497,6 +672,7 @@ class AmaranLight:
             self._preferred_gm = state.gm
         changed = state != self._state or self._preferred_gm != previous_gm
         self._state = state
+        self._missed_polls = 0
         # Always release refresh waiters -- a report that matches what we
         # already had still proves the fixture answered.
         self._state_received.set()
@@ -512,11 +688,21 @@ class AmaranLight:
     async def _async_before_sequence(self, sequence: int) -> None:
         """Reserve the sequence's block before the proxy transmits it."""
         assert self._sequence_reservation is not None
-        await self._sequence_reservation.ensure_reserved(sequence)
+        try:
+            await self._sequence_reservation.ensure_reserved(sequence)
+        except OSError as err:
+            raise AmaranConnectionError(
+                "Bluetooth Mesh sequence reservation could not be persisted"
+            ) from err
 
     async def _async_save_sequence(self, data: dict[str, int]) -> None:
-        await _async_verified_sequence_save(
-            self.hass, self._entry_id, self._store, data
+        await _async_save_sequence_stores(
+            self.hass,
+            self._sequence_store_id,
+            self._store,
+            self._compatibility_sequence_store_id,
+            self._compatibility_store,
+            data,
         )
 
     @callback
@@ -535,7 +721,8 @@ async def async_release_node(
     unicast_address: int,
     local_address: int,
     iv_index: int,
-    entry_id: str,
+    sequence_store_id: str,
+    compatibility_sequence_store_id: str | None = None,
     minimum_sequence: int = 0,
 ) -> bool:
     """Factory-reset the node so it stops belonging to our mesh.
@@ -553,13 +740,28 @@ async def async_release_node(
 
     client = await establish_connection(BleakClient, ble_device, address)
     try:
-        store = _sequence_store(hass, entry_id)
+        store = _sequence_store(hass, sequence_store_id)
+        compatibility_sequence_store_id = (
+            compatibility_sequence_store_id or sequence_store_id
+        )
+        compatibility_store = (
+            None
+            if compatibility_sequence_store_id == sequence_store_id
+            else _sequence_store(hass, compatibility_sequence_store_id)
+        )
 
         async def save(data: dict[str, int]) -> None:
-            await _async_verified_sequence_save(hass, entry_id, store, data)
+            await _async_save_sequence_stores(
+                hass,
+                sequence_store_id,
+                store,
+                compatibility_sequence_store_id,
+                compatibility_store,
+                data,
+            )
 
         reservation = SequenceReservation.create(
-            await store.async_load() or {},
+            await _async_load_sequence_stores(store, compatibility_store),
             save,
             block_size=SEQUENCE_CHECKPOINT,
             minimum_sequence=minimum_sequence,
@@ -672,7 +874,8 @@ async def async_configure_stored_node(
     local_address: int,
     iv_index: int,
     sequence: int,
-    entry_id: str,
+    sequence_store_id: str,
+    compatibility_sequence_store_id: str | None = None,
 ) -> int:
     """Resume post-provision configuration retained in a config entry."""
     ble_device = bluetooth.async_ble_device_from_address(
@@ -687,13 +890,28 @@ async def async_configure_stored_node(
         raise AmaranConnectionError(f"could not connect to {address}: {err}") from err
 
     try:
-        store = _sequence_store(hass, entry_id)
+        store = _sequence_store(hass, sequence_store_id)
+        compatibility_sequence_store_id = (
+            compatibility_sequence_store_id or sequence_store_id
+        )
+        compatibility_store = (
+            None
+            if compatibility_sequence_store_id == sequence_store_id
+            else _sequence_store(hass, compatibility_sequence_store_id)
+        )
 
         async def save(data: dict[str, int]) -> None:
-            await _async_verified_sequence_save(hass, entry_id, store, data)
+            await _async_save_sequence_stores(
+                hass,
+                sequence_store_id,
+                store,
+                compatibility_sequence_store_id,
+                compatibility_store,
+                data,
+            )
 
         reservation = SequenceReservation.create(
-            await store.async_load() or {},
+            await _async_load_sequence_stores(store, compatibility_store),
             save,
             block_size=SEQUENCE_CHECKPOINT,
             minimum_sequence=sequence,

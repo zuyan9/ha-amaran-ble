@@ -1,6 +1,6 @@
 [project]
 name = "ha-amaran-ble"
-version = "0.3.0"
+version = "0.3.1"
 description = "Home Assistant custom integration for amaran Bluetooth Mesh lights"
 readme = "README.md"
 requires-python = ">=3.14"
@@ -20,7 +20,7 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 88
-target-version = "py313"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = ["ASYNC", "B", "E", "F", "I", "LOG", "RUF", "SIM", "UP", "W"]

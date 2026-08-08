@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from amaranble.config_client import CompositionData, ConfigError
+from amaranble.config_client import CompositionData, ConfigClient, ConfigError
 from amaranble.provisioning import Capabilities, ProvisioningError
 
 
@@ -37,11 +37,29 @@ def test_composition_data_rejects_truncation() -> None:
     with pytest.raises(ConfigError):
         CompositionData.parse(b"\x00short", 2)
 
+    valid_header = bytes.fromhex("0011020540010010000000")
+    with pytest.raises(ConfigError, match="element header"):
+        CompositionData.parse(valid_header + b"\x00", 2)
+
 
 def test_provisioning_capabilities() -> None:
     capabilities = Capabilities.parse(bytes.fromhex("0100010000000000000000"))
     assert capabilities.num_elements == 1
     assert capabilities.supports_cmac_aes128
 
-    with pytest.raises(ProvisioningError, match="short"):
+    with pytest.raises(ProvisioningError, match="must be 11 bytes"):
         Capabilities.parse(b"short")
+
+
+@pytest.mark.asyncio
+async def test_app_key_index_already_stored_is_not_success() -> None:
+    class DifferentKeyProxy:
+        async def request(self, *_args, **_kwargs):
+            class Reply:
+                parameters = bytes.fromhex("06000000")
+
+            return Reply()
+
+    config = ConfigClient(DifferentKeyProxy(), 2)  # type: ignore[arg-type]
+    with pytest.raises(ConfigError, match="key index already stored"):
+        await config.add_app_key(b"A" * 16)

@@ -81,6 +81,13 @@ def test_bounds_are_clamped() -> None:
     assert telink.hsi(-1, -1, -1) == telink.hsi(0, 0, 0)
 
 
+def test_command_values_use_javascript_half_up_rounding() -> None:
+    assert telink.brightness(0.5) == telink.brightness(1)
+    assert telink.cct(5600, 500.5, 0.5) == telink.cct(5600, 501, 1)
+    assert telink.cct(5600, 500, -1.5) == telink.cct(5600, 500, -1)
+    assert telink.hsi(44.5, 60.5, 800.5) == telink.hsi(45, 61, 801)
+
+
 def test_decode_rejects_invalid_or_non_state_payloads() -> None:
     invalid = bytearray(_as_report(telink.cct(5000, 500), on=True))
     invalid[3] ^= 1

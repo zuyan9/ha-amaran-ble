@@ -5,7 +5,7 @@
 # amaran BLE for Home Assistant
 
 Local Bluetooth Mesh control for amaran photography lights in Home Assistant.
-No amaran account, cloud service, MQTT, or external bridge is required.
+No amaran account, vendor cloud service, MQTT, or vendor bridge is required.
 
 ## Installation
 
@@ -67,3 +67,6 @@ importing an existing Sidus Link mesh are not currently supported.
   factory-reset it and try again.
 - **Entity unavailable:** confirm the light is powered on and that the adapter
   or proxy supports active Bluetooth connections.
+- **Removing a light:** keep it powered on and in range while deleting the
+  integration so Home Assistant can release it from the private mesh. If that
+  cannot complete, factory-reset the fixture before pairing it again.

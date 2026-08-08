@@ -7,6 +7,7 @@ has to be extracted from amaran's own app.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 from typing import Any
@@ -42,6 +43,7 @@ from .const import (
     CONF_NEEDS_CONFIGURATION,
     CONF_NET_KEY,
     CONF_NUM_ELEMENTS,
+    CONF_SEQUENCE_STORE_ID,
     CONF_SUPPORTS_CCT,
     CONF_SUPPORTS_COLOR,
     CONF_SUPPORTS_GM,
@@ -59,11 +61,14 @@ from .const import (
 from .pending import (
     PendingProvisionError,
     async_get_pending,
-    async_remove_pending,
     async_save_pending,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# A broken BLE backend must not leave a config flow stuck while it tears down
+# the provisioning connection.
+DISCONNECT_TIMEOUT = 5.0
 
 
 def is_amaran_fixture(info: BluetoothServiceInfoBleak) -> bool:
@@ -287,23 +292,25 @@ class AmaranConfigFlow(ConfigFlow, domain=DOMAIN):
 
     async def _async_provision(self, info: BluetoothServiceInfoBleak) -> dict[str, Any]:
         """Provision the fixture or recover credentials from an interrupted flow."""
-        pending = await async_get_pending(self.hass, info.address)
-        if pending is not None and "data" in pending:
-            # New records distinguish credentials prepared before the
-            # irreversible Provisioning Data PDU from a session for which the
-            # fixture sent Complete. If it plainly still advertises only the
-            # provisioning service, the PDU never committed and those keys are
-            # safe to discard. Ambiguous/cached advertisements deliberately
-            # favor retaining keys that may now be the only way into the node.
-            if (
-                not pending.get("committed", False)
-                and MESH_PROVISIONING_SERVICE in info.service_data
-                and MESH_PROXY_SERVICE not in info.service_data
-            ):
-                await async_remove_pending(self.hass, info.address)
-                pending = None
-            else:
-                pending = pending["data"]
+        pending_record = await async_get_pending(self.hass, info.address)
+        pending: dict[str, Any] | None = None
+        if pending_record is not None and "data" in pending_record:
+            # The discovery object belongs to the start of this flow. It can
+            # still say "unprovisioned" after the Provisioning Data PDU has
+            # committed but before Complete arrived. At that point these keys
+            # are the only way back into the node, so never discard a durable
+            # record based on advertisement state.
+            pending = dict(pending_record["data"])
+            if CONF_SEQUENCE_STORE_ID not in pending:
+                # Older pending records predate stable sequence-store IDs. Give
+                # one to the recovery credentials and verify it on disk before
+                # a replacement config entry can consume any mesh sequence.
+                pending[CONF_SEQUENCE_STORE_ID] = crypto.random_bytes(16).hex()
+                await async_save_pending(
+                    self.hass,
+                    info.address,
+                    {**pending_record, "data": pending},
+                )
 
         if pending is not None:
             _LOGGER.info(
@@ -314,6 +321,11 @@ class AmaranConfigFlow(ConfigFlow, domain=DOMAIN):
 
         net_key = crypto.random_bytes(16)
         app_key = crypto.random_bytes(16)
+        # Config entries are written asynchronously. If Home Assistant crashes
+        # after setup has reserved mesh sequences but before the entry reaches
+        # disk, recovery creates a new entry_id. Keep the sequence store tied
+        # to the durable pending credentials instead of that transient ID.
+        sequence_store_id = crypto.random_bytes(16).hex()
         name = suggested_title(info)
         data: dict[str, Any] | None = None
 
@@ -331,6 +343,7 @@ class AmaranConfigFlow(ConfigFlow, domain=DOMAIN):
                 CONF_NUM_ELEMENTS: num_elements,
                 CONF_IV_INDEX: 0,
                 CONF_INITIAL_SEQUENCE: 0,
+                CONF_SEQUENCE_STORE_ID: sequence_store_id,
                 CONF_NEEDS_CONFIGURATION: True,
             }
             await async_save_pending(
@@ -354,8 +367,9 @@ class AmaranConfigFlow(ConfigFlow, domain=DOMAIN):
                 before_commit=save_before_commit,
             )
         finally:
-            with contextlib.suppress(Exception):
-                await client.disconnect()
+            with contextlib.suppress(Exception, TimeoutError):
+                async with asyncio.timeout(DISCONNECT_TIMEOUT):
+                    await client.disconnect()
 
         if data is None:
             raise ProvisioningError(

@@ -107,6 +107,8 @@ class CompositionData:
                 offset += 4
             elements.append(element)
             index += 1
+        if offset != len(data):
+            raise ConfigError("truncated composition data (element header)")
         return cls(company_id, product_id, version_id, crpl, features, elements)
 
 
@@ -157,11 +159,9 @@ class ConfigClient:
             device_key_for=self._address,
             response_matcher=lambda message: message.parameters[1:4] == key_indexes,
         )
-        # A key that is already stored is not an error for our purposes -- it
-        # means a previous run got this far.
-        if reply.parameters and reply.parameters[0] == 0x06:
-            _LOGGER.debug("app key already present on %#06x", self._address)
-            return
+        # Re-adding the same AppKey is required to return Success. Status 0x06
+        # specifically means this index contains a *different* key, so treating
+        # it as resumable would bind models to a key we do not possess.
         _check_status(reply.parameters[0] if reply.parameters else 0xFF, "AppKey Add")
 
     async def bind_model(
@@ -218,7 +218,7 @@ class ConfigClient:
                 retries=1,
                 timeout=4.0,
             )
-        except (ProxyError, NetworkDecodeError):
+        except ProxyError, NetworkDecodeError:
             # Nodes commonly reset before the status reaches us. The caller
             # separately checks whether the BLE link dropped before deciding
             # that the reset succeeded.

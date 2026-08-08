@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import random
+
 import pytest
 from amaranble import crypto, network
 
@@ -54,6 +57,12 @@ def test_network_rejects_wrong_key_and_tampering() -> None:
     tampered = encoded[:-1] + bytes([encoded[-1] ^ 1])
     with pytest.raises(network.NetworkDecodeError, match="MIC"):
         network.decode_network_pdu(keys, 0, tampered)
+
+    with pytest.raises(network.NetworkDecodeError, match="IVI"):
+        network.decode_network_pdu(keys, 1, encoded)
+
+    with pytest.raises(network.NetworkDecodeError, match="length"):
+        network.decode_network_pdu(keys, 0, encoded + b"too long" * 3)
 
 
 def test_proxy_configuration_matches_mesh_profile_vector() -> None:
@@ -121,11 +130,139 @@ def test_segment_build_and_reassembly() -> None:
     assert len(segments) == 3
 
     reassembler = network.SegmentReassembler()
-    assert reassembler.add(2, 0x122345, segments[0]) is None
-    assert reassembler.add(2, 0x122346, segments[1]) is None
-    complete = reassembler.add(2, 0x122347, segments[2])
+    first = reassembler.add(2, 1, 0x122345, segments[0])
+    second = reassembler.add(2, 1, 0x122346, segments[1])
+    complete = reassembler.add(2, 1, 0x122347, segments[2])
 
-    assert complete == (upper, 1, 0x12, 0, 0x122345)
+    assert first.upper_pdu is None
+    assert second.upper_pdu is None
+    assert complete.upper_pdu == upper
+    assert complete.segment.akf == 1
+    assert complete.segment.aid == 0x12
+    assert complete.segment.szmic == 0
+    assert complete.segment.seq_auth == 0x122345
+    assert complete.last_segment_seq == 0x122347
+
+    repeated = reassembler.add(2, 1, 0x122348, segments[0])
+    assert repeated.already_complete
+    assert repeated.block_ack == 0b111
+
+
+def test_segment_reassembly_rejects_malformed_and_inconsistent_input() -> None:
+    reassembler = network.SegmentReassembler()
+
+    # Formerly reached the completion path with a missing segment and raised
+    # KeyError while leaving attacker-controlled state behind.
+    with pytest.raises(network.NetworkDecodeError):
+        reassembler.add(2, 1, 0x20, bytes.fromhex("8000002078"))
+    assert reassembler._pending == {}
+
+    segments = network.build_access_segments(1, 0x12, 0x345, bytes(range(20)))
+    reassembler.add(2, 1, 0x345, segments[0])
+    changed = bytearray(segments[1])
+    changed[0] ^= 0x01  # AID must be stable for the whole transaction.
+    with pytest.raises(network.NetworkDecodeError, match="metadata"):
+        reassembler.add(2, 1, 0x346, bytes(changed))
+
+
+def test_segment_reassembly_expires_and_does_not_alias_seqzero() -> None:
+    now = [0.0]
+    reassembler = network.SegmentReassembler(timeout=10, clock=lambda: now[0])
+    old = network.build_access_segments(1, 1, 0x345, bytes(range(20)))
+    new = network.build_access_segments(1, 1, 0x345, bytes(range(30, 50)))
+
+    reassembler.add(2, 1, 0x345, old[0])
+    # SeqZero repeats after 8192 sequence numbers. Receiving the newer message
+    # out of order must not splice its segment onto the abandoned old one.
+    result = reassembler.add(2, 1, 0x2346, new[1])
+    assert result.upper_pdu is None
+    assert result.block_ack == 0b10
+    complete = reassembler.add(2, 1, 0x2345, new[0])
+    assert complete.upper_pdu == bytes(range(30, 50))
+
+    later = network.build_access_segments(1, 1, 0x456, bytes(range(20)))
+    reassembler.add(3, 1, 0x456, later[0])
+    now[0] = 11
+    reassembler.add(4, 1, 0x456, later[0])
+    assert all(key[0] != 3 for key in reassembler._pending)
+
+
+def test_expired_segmented_transaction_cannot_be_resurrected() -> None:
+    now = [0.0]
+    reassembler = network.SegmentReassembler(timeout=10, clock=lambda: now[0])
+    segments = network.build_access_segments(1, 1, 100, bytes(range(20)))
+
+    reassembler.add(2, 1, 100, segments[0])
+    now[0] = 11
+    with pytest.raises(network.NetworkDecodeError, match="discarded transaction"):
+        reassembler.add(2, 1, 101, segments[1])
+    with pytest.raises(network.NetworkDecodeError, match="discarded transaction"):
+        reassembler.add(2, 1, 102, segments[0])
+
+    newer = network.build_access_segments(1, 1, 200, bytes(range(20, 40)))
+    first = reassembler.add(2, 1, 200, newer[0])
+    complete = reassembler.add(2, 1, 201, newer[1])
+    assert first.upper_pdu is None
+    assert complete.upper_pdu == bytes(range(20, 40))
+
+
+def test_completed_segment_replay_state_does_not_expire_or_evict() -> None:
+    now = [0.0]
+    reassembler = network.SegmentReassembler(
+        timeout=10,
+        max_completed=1,
+        clock=lambda: now[0],
+    )
+    segments = network.build_access_segments(1, 1, 0x345, bytes(range(20)))
+    reassembler.add(2, 1, 0x345, segments[0])
+    complete = reassembler.add(2, 1, 0x346, segments[1])
+    assert complete.upper_pdu == bytes(range(20))
+
+    now[0] = 100
+    assert reassembler.completed_ack(2, 1, 0x345) == 0b11
+    repeated = reassembler.add(2, 1, 0x347, segments[0])
+    assert repeated.already_complete
+    assert repeated.block_ack == 0b11
+
+    changed_metadata = bytearray(segments[0])
+    changed_metadata[3] = (changed_metadata[3] & 0xE0) | 0x02
+    with pytest.raises(network.NetworkDecodeError, match="metadata changed"):
+        reassembler.add(2, 1, 0x348, bytes(changed_metadata))
+
+    other = network.build_access_segments(1, 1, 0x400, b"other")
+    with pytest.raises(network.NetworkDecodeError, match="tracking capacity"):
+        reassembler.add(3, 1, 0x400, other[0])
+    assert reassembler.completed_ack(2, 1, 0x345) == 0b11
+
+
+def test_completed_tracking_capacity_is_reserved_by_pending_transactions() -> None:
+    reassembler = network.SegmentReassembler(max_pending=3, max_completed=2)
+    segments = network.build_access_segments(1, 1, 1, bytes(range(20)))
+
+    reassembler.add(2, 1, 1, segments[0])
+    reassembler.add(3, 1, 1, segments[0])
+    with pytest.raises(network.NetworkDecodeError, match="tracking capacity"):
+        reassembler.add(4, 1, 1, segments[0])
+
+    reassembler.add(2, 1, 2, segments[1])
+    reassembler.add(3, 1, 2, segments[1])
+    assert len(reassembler._completed) == 2
+
+
+def test_segment_reassembly_fuzz_is_bounded_and_never_leaks_exceptions() -> None:
+    rng = random.Random(0)
+    reassembler = network.SegmentReassembler(max_pending=8)
+    for _ in range(5000):
+        length = rng.randrange(1, 25)
+        lower = bytes([rng.randrange(0x80, 0x100)]) + rng.randbytes(length - 1)
+        with contextlib.suppress(network.NetworkDecodeError):
+            reassembler.add(
+                rng.randrange(1, 0x8000),
+                rng.randrange(1, 0x10000),
+                rng.randrange(0x1000000),
+                lower,
+            )
+        assert len(reassembler._pending) <= 8
 
 
 @pytest.mark.parametrize(
@@ -144,3 +281,6 @@ def test_segment_ack() -> None:
     assert ack.block_ack == 0x07
     assert ack.acknowledges_all(3)
     assert not ack.acknowledges_all(4)
+
+    with pytest.raises(network.NetworkDecodeError, match="RFU"):
+        network.parse_segment_ack(bytes.fromhex("0d1500000007"))

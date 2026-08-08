@@ -11,7 +11,7 @@
       },
       "confirm": {
         "title": "Add {name}",
-        "description": "Home Assistant will provision {name} ({address}) into its own private Bluetooth Mesh network.\n\nThis takes the fixture out of any mesh it currently belongs to, so the amaran app will no longer see it until you factory reset the light. Verify that the address belongs to the intended amaran fixture before continuing.",
+        "description": "Home Assistant will provision {name} ({address}) into its own private Bluetooth Mesh network.\n\nThe fixture must already be factory reset. After setup, the amaran app will not see it until you factory reset it again. Verify that the address belongs to the intended amaran fixture before continuing.",
         "data": {
           "supports_cct": "Fixture has adjustable colour temperature",
           "supports_color": "Fixture supports full colour (HSI)",

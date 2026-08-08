@@ -26,6 +26,7 @@ from .const import (
     CONF_MIN_KELVIN,
     CONF_NEEDS_CONFIGURATION,
     CONF_NET_KEY,
+    CONF_SEQUENCE_STORE_ID,
     CONF_SUPPORTS_COLOR,
     CONF_UNICAST_ADDRESS,
     DEFAULT_MAX_KELVIN,
@@ -92,6 +93,15 @@ async def async_migrate_entry(hass: HomeAssistant, entry: AmaranConfigEntry) -> 
 async def async_setup_entry(hass: HomeAssistant, entry: AmaranConfigEntry) -> bool:
     """Connect to the fixture and set up its light entity."""
     data = entry.data
+    if CONF_SEQUENCE_STORE_ID not in data:
+        # Legacy entries already used entry_id as their sequence-store key.
+        # Recording that fallback keeps the key explicit without abandoning
+        # the existing high-water mark.
+        updated = dict(data)
+        updated[CONF_SEQUENCE_STORE_ID] = entry.entry_id
+        hass.config_entries.async_update_entry(entry, data=updated)
+        data = entry.data
+    sequence_store_id = data[CONF_SEQUENCE_STORE_ID]
     if data.get(CONF_NEEDS_CONFIGURATION):
         try:
             initial_sequence = await async_configure_stored_node(
@@ -105,7 +115,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: AmaranConfigEntry) -> bo
                 local_address=data.get(CONF_LOCAL_ADDRESS, PROVISIONER_ADDRESS),
                 iv_index=data.get(CONF_IV_INDEX, 0),
                 sequence=data.get(CONF_INITIAL_SEQUENCE, 0),
-                entry_id=entry.entry_id,
+                sequence_store_id=sequence_store_id,
+                compatibility_sequence_store_id=entry.entry_id,
             )
         except NodeConfigurationError as err:
             updated = dict(data)
@@ -125,9 +136,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: AmaranConfigEntry) -> bo
 
     device = AmaranLight(
         hass,
-        entry.entry_id,
+        sequence_store_id,
         data[CONF_ADDRESS],
         data.get(CONF_NAME) or entry.title,
+        compatibility_sequence_store_id=entry.entry_id,
         net_key=bytes.fromhex(data[CONF_NET_KEY]),
         app_key=bytes.fromhex(data[CONF_APP_KEY]),
         device_key=bytes.fromhex(data[CONF_DEVICE_KEY]),
@@ -138,19 +150,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: AmaranConfigEntry) -> bo
     )
 
     try:
-        await device.async_start()
-    except AmaranNotProvisionedError as err:
-        await device.async_stop()
-        raise ConfigEntryNotReady(
-            f"{entry.title} has been factory reset and is no longer part of Home "
-            "Assistant's mesh. Delete this device and add it again to re-provision it."
-        ) from err
-    except AmaranConnectionError as err:
-        await device.async_stop()
-        raise ConfigEntryNotReady(str(err)) from err
+        try:
+            await device.async_start()
+        except AmaranNotProvisionedError as err:
+            raise ConfigEntryNotReady(
+                f"{entry.title} has been factory reset and is no longer part of Home "
+                "Assistant's mesh. Delete this device and add it again to re-provision it."
+            ) from err
+        except AmaranConnectionError as err:
+            raise ConfigEntryNotReady(str(err)) from err
 
-    entry.runtime_data = device
-    try:
+        entry.runtime_data = device
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     except BaseException:
         await device.async_stop()
@@ -182,6 +192,7 @@ async def async_remove_entry(hass: HomeAssistant, entry: AmaranConfigEntry) -> N
     removal itself must still succeed.
     """
     data = entry.data
+    sequence_store_id = data.get(CONF_SEQUENCE_STORE_ID, entry.entry_id)
     try:
         async with asyncio.timeout(RELEASE_TIMEOUT):
             released = await async_release_node(
@@ -193,7 +204,8 @@ async def async_remove_entry(hass: HomeAssistant, entry: AmaranConfigEntry) -> N
                 unicast_address=data.get(CONF_UNICAST_ADDRESS, NODE_ADDRESS),
                 local_address=data.get(CONF_LOCAL_ADDRESS, PROVISIONER_ADDRESS),
                 iv_index=data.get(CONF_IV_INDEX, 0),
-                entry_id=entry.entry_id,
+                sequence_store_id=sequence_store_id,
+                compatibility_sequence_store_id=entry.entry_id,
                 minimum_sequence=data.get(CONF_INITIAL_SEQUENCE, 0),
             )
     except Exception as err:  # Removal must never block config-entry deletion.
@@ -223,4 +235,12 @@ async def async_remove_entry(hass: HomeAssistant, entry: AmaranConfigEntry) -> N
             err,
         )
 
-    await Store(hass, 1, f"{DOMAIN}.{entry.entry_id}").async_remove()
+    for store_id in dict.fromkeys((sequence_store_id, entry.entry_id)):
+        try:
+            await Store(hass, 1, f"{DOMAIN}.{store_id}").async_remove()
+        except Exception as err:  # Entry deletion must not depend on cache cleanup.
+            _LOGGER.warning(
+                "could not remove sequence state for %s: %s",
+                entry.title,
+                err,
+            )
