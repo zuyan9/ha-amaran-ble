@@ -21,6 +21,11 @@ CONF_NUM_ELEMENTS: Final = "num_elements"
 CONF_INITIAL_SEQUENCE: Final = "initial_sequence"
 CONF_SEQUENCE_STORE_ID: Final = "sequence_store_id"
 CONF_NEEDS_CONFIGURATION: Final = "needs_configuration"
+# The Bluetooth address used to identify the config entry never changes: every
+# entity and device-registry identifier is derived from it. A provisioned Mesh
+# node may later advertise through a different (for example random) address, so
+# keep that reconnect hint separate from the stable identity.
+CONF_TRANSPORT_ADDRESS: Final = "transport_address"
 
 # Config entry options.
 CONF_MODEL: Final = "model"

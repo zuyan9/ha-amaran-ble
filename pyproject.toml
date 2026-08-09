@@ -3,7 +3,7 @@ name = "ha-amaran-ble"
 version = "0.5.0"
 description = "Home Assistant custom integration for amaran Bluetooth Mesh lights"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.14.2"
 license = "MIT"
 dependencies = ["cryptography>=45"]
 
@@ -12,11 +12,20 @@ test = [
   "pytest>=8",
   "pytest-asyncio>=0.25",
 ]
+ha-test = [
+  # 0.13.354 pins Home Assistant 2026.8.0, our declared minimum.
+  "aiousbwatcher==1.1.2",
+  "pytest-homeassistant-custom-component==0.13.354",
+  "serialx==1.8.2",
+]
 lint = ["ruff>=0.12"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.uv]
+default-groups = ["test", "ha-test", "lint"]
 
 [tool.ruff]
 line-length = 88

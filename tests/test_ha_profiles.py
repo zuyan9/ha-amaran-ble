@@ -8,8 +8,6 @@ from unittest.mock import Mock
 
 import pytest
 
-pytest.importorskip("homeassistant")
-
 from custom_components.amaran_ble import async_migrate_entry
 from custom_components.amaran_ble.config_flow import (
     _model_selector,

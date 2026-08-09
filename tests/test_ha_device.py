@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock, Mock
 
 import pytest
-
-pytest.importorskip("homeassistant")
 
 from custom_components.amaran_ble import device
 from custom_components.amaran_ble.amaranble import (
@@ -38,7 +37,7 @@ class FakeStore:
 
 
 def make_light(
-    monkeypatch: pytest.MonkeyPatch, *, profile=GENERIC_PROFILE
+    monkeypatch: pytest.MonkeyPatch, *, profile=GENERIC_PROFILE, **kwargs: Any
 ) -> device.AmaranLight:
     """Build a device without touching Home Assistant's real storage manager."""
     monkeypatch.setattr(
@@ -58,6 +57,7 @@ def make_light(
         local_address=1,
         iv_index=0,
         profile=profile,
+        **kwargs,
     )
 
 
@@ -232,7 +232,9 @@ async def test_async_stop_cannot_lose_race_with_inflight_connect(
 
     monkeypatch.setattr(device, "establish_connection", establish)
     monkeypatch.setattr(
-        device.bluetooth, "async_ble_device_from_address", Mock(return_value=Mock())
+        device,
+        "async_mesh_proxy_candidates",
+        Mock(return_value=(device.MeshProxyCandidate(light.address, Mock()),)),
     )
 
     connecting = asyncio.create_task(light._async_connect())
@@ -247,6 +249,409 @@ async def test_async_stop_cannot_lose_race_with_inflight_connect(
 
     assert light._client is None
     assert light._proxy is None
+    client.disconnect.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_connect_uses_crypto_resolved_alternate_without_changing_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A random transport address never changes stable entity/device identity."""
+    light = make_light(
+        monkeypatch,
+        transport_address="22:22:22:22:22:22",
+    )
+    alternate = "11:22:33:44:55:66"
+    ble_device = Mock(name="manager-selected device")
+    candidate = device.MeshProxyCandidate(alternate, ble_device)
+    resolve = Mock(return_value=(candidate,))
+    monkeypatch.setattr(device, "async_mesh_proxy_candidates", resolve)
+    client = Mock(is_connected=True)
+    client.disconnect = AsyncMock()
+    establish = AsyncMock(return_value=client)
+    monkeypatch.setattr(device, "establish_connection", establish)
+    proxy = Mock()
+    proxy.start = AsyncMock()
+    proxy.stop = AsyncMock()
+    monkeypatch.setattr(device, "ProxyClient", Mock(return_value=proxy))
+    light._async_refresh_state = AsyncMock()
+    light._async_refresh_diagnostics = AsyncMock()
+
+    await light._async_connect()
+
+    assert light.address == "AA:BB:CC:DD:EE:FF"
+    assert light.using_alternate_address
+    assert light._client is client
+    assert light._proxy is proxy
+    resolve.assert_called_once_with(
+        light.hass,
+        light.address,
+        net_key=b"\x01" * 16,
+        unicast_address=2,
+        transport_address="22:22:22:22:22:22",
+    )
+    assert establish.await_args.args[:3] == (
+        device.BleakClient,
+        ble_device,
+        "Test light",
+    )
+    proxy.start.assert_awaited_once_with(subscribe_addresses=[2])
+
+
+@pytest.mark.asyncio
+async def test_not_provisioned_and_recovery_callbacks_are_episode_deduplicated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repairs callbacks fire once on loss and once after proven recovery."""
+    lost = Mock()
+    recovered = Mock()
+    light = make_light(
+        monkeypatch,
+        on_not_provisioned=lost,
+        on_provisioned=recovered,
+    )
+    for _ in range(2):
+        light._notify_not_provisioned()
+    lost.assert_called_once_with()
+    recovered.assert_not_called()
+
+    light._notify_provisioned()
+
+    recovered.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_bare_proxy_does_not_report_recovery_until_primary_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A GATT Proxy handshake cannot clear a Repair without node traffic."""
+    recovered = Mock()
+    light = make_light(
+        monkeypatch,
+        profile=ACE_25X_PROFILE,
+        on_provisioned=recovered,
+    )
+    candidate = device.MeshProxyCandidate(light.address, Mock())
+    monkeypatch.setattr(
+        device, "async_mesh_proxy_candidates", Mock(return_value=(candidate,))
+    )
+    client = Mock(is_connected=True, disconnect=AsyncMock())
+    monkeypatch.setattr(
+        device, "_async_establish_candidate", AsyncMock(return_value=client)
+    )
+    proxy = Mock(start=AsyncMock(), stop=AsyncMock())
+    monkeypatch.setattr(device, "ProxyClient", Mock(return_value=proxy))
+    light._async_refresh_state = AsyncMock(return_value=False)
+    light._async_refresh_diagnostics = AsyncMock()
+
+    await light._async_connect()
+
+    recovered.assert_not_called()
+    assert light.connected
+    assert not light.available
+
+    light._on_access_message(access_message(fan_report(telink.FanMode.SMART)))
+    recovered.assert_not_called()
+
+    status = access_message(as_report(telink.cct(4300, 250), on=True))
+    light._on_access_message(status)
+    light._on_access_message(status)
+
+    recovered.assert_called_once_with()
+    assert light.available
+
+
+@pytest.mark.asyncio
+async def test_cached_provisioning_advert_with_fresh_proxy_gatt_does_not_report_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale provisioning page cannot open a Repair for a live Proxy bearer."""
+    lost = Mock()
+    light = make_light(monkeypatch, on_not_provisioned=lost)
+    ble_device = Mock()
+    monkeypatch.setattr(
+        device.bluetooth,
+        "async_ble_device_from_address",
+        Mock(return_value=ble_device),
+    )
+    monkeypatch.setattr(
+        device.bluetooth,
+        "async_last_service_info",
+        Mock(
+            return_value=SimpleNamespace(
+                address=light.address,
+                service_data={device.MESH_PROVISIONING_SERVICE: b"\x00"},
+                time=1.0,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        device.bluetooth,
+        "async_discovered_service_info",
+        Mock(return_value=()),
+    )
+
+    proxy_service = object()
+    proxy_characteristic = object()
+    services = Mock()
+    services.get_service.side_effect = lambda uuid: (
+        proxy_service if uuid == device.MESH_PROXY_SERVICE else None
+    )
+    services.get_characteristic.side_effect = lambda uuid: (
+        proxy_characteristic
+        if uuid in {device.PROXY_DATA_IN, device.PROXY_DATA_OUT}
+        else None
+    )
+    client = Mock(is_connected=True, services=services, disconnect=AsyncMock())
+    monkeypatch.setattr(device, "establish_connection", AsyncMock(return_value=client))
+    proxy = Mock(start=AsyncMock(), stop=AsyncMock())
+    monkeypatch.setattr(device, "ProxyClient", Mock(return_value=proxy))
+    light._async_refresh_state = AsyncMock()
+    light._async_refresh_diagnostics = AsyncMock()
+
+    await light._async_connect()
+
+    lost.assert_not_called()
+    assert light.connected
+
+
+@pytest.mark.asyncio
+async def test_live_provisioning_gatt_overrides_additive_proxy_advert_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fresh GATT truth reports reset despite stale matching proxy service data."""
+    lost = Mock()
+    light = make_light(monkeypatch, on_not_provisioned=lost)
+    keys = device.network.NetworkKeys.derive(b"\x01" * 16)
+    additive_info = SimpleNamespace(
+        address=light.address,
+        service_data={
+            device.MESH_PROVISIONING_SERVICE: b"\x00",
+            device.MESH_PROXY_SERVICE: b"\x00" + keys.network_id,
+        },
+        time=1.0,
+    )
+    ble_device = Mock()
+    monkeypatch.setattr(
+        device.bluetooth,
+        "async_ble_device_from_address",
+        Mock(return_value=ble_device),
+    )
+    monkeypatch.setattr(
+        device.bluetooth,
+        "async_last_service_info",
+        Mock(return_value=additive_info),
+    )
+    monkeypatch.setattr(
+        device.bluetooth,
+        "async_discovered_service_info",
+        Mock(return_value=()),
+    )
+
+    provisioning_service = object()
+    provisioning_characteristic = object()
+    services = Mock()
+    services.get_service.side_effect = lambda uuid: (
+        provisioning_service if uuid == device.MESH_PROVISIONING_SERVICE else None
+    )
+    services.get_characteristic.side_effect = lambda uuid: (
+        provisioning_characteristic
+        if uuid in {device.PROVISIONING_DATA_IN, device.PROVISIONING_DATA_OUT}
+        else None
+    )
+    client = Mock(is_connected=True, services=services, disconnect=AsyncMock())
+    monkeypatch.setattr(device, "establish_connection", AsyncMock(return_value=client))
+    proxy_factory = Mock()
+    monkeypatch.setattr(device, "ProxyClient", proxy_factory)
+
+    with pytest.raises(device.AmaranNotProvisionedError):
+        await light._async_connect()
+
+    lost.assert_called_once_with()
+    client.disconnect.assert_awaited_once_with()
+    proxy_factory.assert_not_called()
+    assert not light.connected
+
+
+@pytest.mark.asyncio
+async def test_persisted_alternate_with_live_provisioning_gatt_reports_reset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reset after address rotation still opens one actionable Repair."""
+    alternate = "11:22:33:44:55:66"
+    lost = Mock()
+    light = make_light(
+        monkeypatch,
+        transport_address=alternate,
+        on_not_provisioned=lost,
+    )
+    candidate = device.MeshProxyCandidate(alternate, Mock())
+    resolve = Mock(return_value=(candidate,))
+    monkeypatch.setattr(device, "async_mesh_proxy_candidates", resolve)
+
+    provisioning_service = object()
+    provisioning_characteristic = object()
+    services = Mock()
+    services.get_service.side_effect = lambda uuid: (
+        provisioning_service if uuid == device.MESH_PROVISIONING_SERVICE else None
+    )
+    services.get_characteristic.side_effect = lambda uuid: (
+        provisioning_characteristic
+        if uuid in {device.PROVISIONING_DATA_IN, device.PROVISIONING_DATA_OUT}
+        else None
+    )
+    client = Mock(is_connected=True, services=services, disconnect=AsyncMock())
+    monkeypatch.setattr(
+        device,
+        "_async_establish_candidate",
+        AsyncMock(return_value=client),
+    )
+    proxy_factory = Mock()
+    monkeypatch.setattr(device, "ProxyClient", proxy_factory)
+
+    with pytest.raises(device.AmaranNotProvisionedError):
+        await light._async_connect()
+
+    lost.assert_called_once_with()
+    client.disconnect.assert_awaited_once_with()
+    proxy_factory.assert_not_called()
+    resolve.assert_called_once_with(
+        light.hass,
+        light.address,
+        net_key=b"\x01" * 16,
+        unicast_address=2,
+        transport_address=alternate,
+    )
+
+
+@pytest.mark.asyncio
+async def test_configure_stored_node_falls_back_to_crypto_resolved_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Post-provision recovery is not stranded on a stale stable address."""
+    stable = device.MeshProxyCandidate("AA:BB:CC:DD:EE:FF", Mock())
+    alternate = device.MeshProxyCandidate("11:22:33:44:55:66", Mock())
+    resolve = Mock(return_value=(stable, alternate))
+    monkeypatch.setattr(device, "async_mesh_proxy_candidates", resolve)
+    client = Mock(disconnect=AsyncMock())
+    establish = AsyncMock(side_effect=[device.BleakError("stale"), client])
+    monkeypatch.setattr(device, "_async_establish_candidate", establish)
+    monkeypatch.setattr(device, "_sequence_store", lambda *_args: FakeStore(None))
+    configure = AsyncMock(return_value=37)
+    monkeypatch.setattr(device, "async_configure_node", configure)
+
+    result = await device.async_configure_stored_node(
+        object(),
+        stable.address,
+        "Test light",
+        net_key=b"\x01" * 16,
+        app_key=b"\x02" * 16,
+        device_key=b"\x03" * 16,
+        unicast_address=2,
+        local_address=1,
+        iv_index=7,
+        sequence=11,
+        sequence_store_id="stable-store",
+        transport_address=alternate.address,
+    )
+
+    assert result == 37
+    assert [await_call.args[1] for await_call in establish.await_args_list] == [
+        stable,
+        alternate,
+    ]
+    configure.assert_awaited_once()
+    client.disconnect.assert_awaited_once_with()
+    resolve.assert_called_once_with(
+        ANY,
+        stable.address,
+        net_key=b"\x01" * 16,
+        unicast_address=2,
+        transport_address=alternate.address,
+    )
+
+
+@pytest.mark.asyncio
+async def test_configure_stored_node_reports_fresh_provisioning_bearer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Post-provision configuration recognizes an intervening factory reset."""
+    candidate = device.MeshProxyCandidate("AA:BB:CC:DD:EE:FF", Mock())
+    monkeypatch.setattr(
+        device, "async_mesh_proxy_candidates", Mock(return_value=(candidate,))
+    )
+    provisioning_service = object()
+    provisioning_characteristic = object()
+    services = Mock()
+    services.get_service.side_effect = lambda uuid: (
+        provisioning_service if uuid == device.MESH_PROVISIONING_SERVICE else None
+    )
+    services.get_characteristic.side_effect = lambda uuid: (
+        provisioning_characteristic
+        if uuid in {device.PROVISIONING_DATA_IN, device.PROVISIONING_DATA_OUT}
+        else None
+    )
+    client = Mock(services=services, disconnect=AsyncMock())
+    monkeypatch.setattr(
+        device, "_async_establish_candidate", AsyncMock(return_value=client)
+    )
+    monkeypatch.setattr(device, "_sequence_store", lambda *_args: FakeStore(None))
+    configure = AsyncMock()
+    monkeypatch.setattr(device, "async_configure_node", configure)
+
+    with pytest.raises(device.AmaranNotProvisionedError):
+        await device.async_configure_stored_node(
+            object(),
+            candidate.address,
+            "Test light",
+            net_key=b"\x01" * 16,
+            app_key=b"\x02" * 16,
+            device_key=b"\x03" * 16,
+            unicast_address=2,
+            local_address=1,
+            iv_index=0,
+            sequence=0,
+            sequence_store_id="stable-store",
+        )
+
+    configure.assert_not_awaited()
+    client.disconnect.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_release_node_uses_crypto_resolved_alternate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Entry removal can safely hand back a fixture after address rotation."""
+    alternate = device.MeshProxyCandidate("11:22:33:44:55:66", Mock())
+    monkeypatch.setattr(
+        device, "async_mesh_proxy_candidates", Mock(return_value=(alternate,))
+    )
+    client = Mock(is_connected=True, disconnect=AsyncMock())
+    monkeypatch.setattr(
+        device, "_async_establish_candidate", AsyncMock(return_value=client)
+    )
+    monkeypatch.setattr(device, "_sequence_store", lambda *_args: FakeStore(None))
+    proxy = Mock(start=AsyncMock(), stop=AsyncMock())
+    monkeypatch.setattr(device, "ProxyClient", Mock(return_value=proxy))
+    config = Mock(node_reset=AsyncMock(return_value=True))
+    monkeypatch.setattr(device, "ConfigClient", Mock(return_value=config))
+
+    assert await device.async_release_node(
+        object(),
+        "AA:BB:CC:DD:EE:FF",
+        net_key=b"\x01" * 16,
+        app_key=b"\x02" * 16,
+        device_key=b"\x03" * 16,
+        unicast_address=2,
+        local_address=1,
+        iv_index=7,
+        sequence_store_id="stable-store",
+        transport_address=alternate.address,
+    )
+    proxy.start.assert_awaited_once_with(subscribe_addresses=[2])
+    config.node_reset.assert_awaited_once_with()
+    proxy.stop.assert_awaited_once_with()
     client.disconnect.assert_awaited_once_with()
 
 
@@ -311,7 +716,8 @@ async def test_not_provisioned_reconnect_backs_off_and_can_recover(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A stale provisioning advert must not permanently strand a healthy light."""
-    light = make_light(monkeypatch)
+    not_provisioned = Mock()
+    light = make_light(monkeypatch, on_not_provisioned=not_provisioned)
     sleeps: list[int] = []
     attempts = 0
 
@@ -332,6 +738,7 @@ async def test_not_provisioned_reconnect_backs_off_and_can_recover(
     assert attempts == 2
     assert sleeps == [device.RECONNECT_MIN_DELAY, device.RECONNECT_MIN_DELAY * 2]
     assert light._reconnect_delay == device.RECONNECT_MIN_DELAY * 2
+    not_provisioned.assert_called_once_with()
 
 
 @pytest.mark.asyncio
@@ -371,6 +778,37 @@ async def test_gm_in_cct_mode_sends_then_refreshes_with_half_up_rounding(
 
     light.async_set_cct.assert_awaited_once_with(4300, 640, 3)
     light._async_confirm_primary_state.assert_awaited_once()
+    assert light.preferred_gm == 3
+
+
+@pytest.mark.asyncio
+async def test_gm_confirmation_accepts_ha_equivalent_intensity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tint-only rewrite accepts firmware quantization of held brightness."""
+    light = make_light(monkeypatch)
+    light._state = light_state(is_hsi=False, intensity=502)
+    status_requests = 0
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        nonlocal status_requests
+        del retries
+        if payload == telink.status_request():
+            status_requests += 1
+            reported_intensity = 499 if status_requests == 1 else 501
+            light._on_access_message(
+                access_message(
+                    as_report(telink.cct(4300, reported_intensity, 3), on=True)
+                )
+            )
+
+    light._async_send = AsyncMock(side_effect=send)
+
+    await light.async_set_gm(3)
+
+    assert status_requests == 2
+    assert light.state is not None
+    assert light.state.intensity == 501
     assert light.preferred_gm == 3
 
 
@@ -929,9 +1367,9 @@ async def test_effect_parameter_confirmation_rejects_changed_preserved_field(
             status_requests += 1
             wrong = telink.effect(
                 telink.SystemEffect.LIGHTNING,
-                intensity=321,
+                intensity=320,
                 frequency=6,
-                speed=7,
+                speed=1,
                 trigger=2,
                 kelvin=4300,
             )
@@ -943,6 +1381,47 @@ async def test_effect_parameter_confirmation_rejects_changed_preserved_field(
         await light.async_set_effect_frequency(6)
 
     assert status_requests == 3
+
+
+@pytest.mark.asyncio
+async def test_effect_parameter_confirmation_accepts_ha_equivalent_intensity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cmd7 rewrite accepts quantization while preserving every other field."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._effect_state = telink.EffectState(
+        on=True,
+        effect=telink.SystemEffect.LIGHTNING,
+        intensity=502,
+        frequency=4,
+        speed=7,
+        trigger=2,
+        kelvin=4300,
+    )
+    status_requests = 0
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        nonlocal status_requests
+        del retries
+        if payload == telink.status_request():
+            status_requests += 1
+            report = telink.effect(
+                telink.SystemEffect.LIGHTNING,
+                intensity=501,
+                frequency=6,
+                speed=7,
+                trigger=2,
+                kelvin=4300,
+            )
+            light._on_access_message(access_message(as_report(report)))
+
+    light._async_send = AsyncMock(side_effect=send)
+
+    await light.async_set_effect_frequency(6)
+
+    assert status_requests == 1
+    assert light.effect_state is not None
+    assert light.effect_state.intensity == 501
 
 
 @pytest.mark.asyncio
@@ -1005,9 +1484,9 @@ async def test_legacy_effect_keeps_cross_generation_intensity(
 async def test_new_effect_accepts_firmware_normalized_opaque_defaults(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A firmware-chosen speed cannot turn a successful FX switch into an error."""
+    """A new cmd7 effect accepts normalized intensity and opaque defaults."""
     light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
-    light._state = light_state(is_hsi=False, intensity=10)
+    light._state = light_state(is_hsi=False, intensity=502)
 
     async def send(payload: bytes, retries: int = 3) -> None:
         del retries
@@ -1015,7 +1494,7 @@ async def test_new_effect_accepts_firmware_normalized_opaque_defaults(
             return
         normalized = telink.effect(
             telink.SystemEffect.PULSING,
-            intensity=10,
+            intensity=501,
             frequency=5,
             speed=1,
             trigger=2,
@@ -1025,10 +1504,11 @@ async def test_new_effect_accepts_firmware_normalized_opaque_defaults(
 
     light._async_send = AsyncMock(side_effect=send)
 
-    await light.async_apply_effect(telink.SystemEffect.PULSING, intensity=10)
+    await light.async_apply_effect(telink.SystemEffect.PULSING, intensity=502)
 
     assert light.effect_state is not None
     assert light.effect_state.effect is telink.SystemEffect.PULSING
+    assert light.effect_state.intensity == 501
     assert light.effect_state.speed == 1
 
 
@@ -1111,6 +1591,48 @@ async def test_sleeping_effect_exit_restores_parameters_before_power(
     ]
 
 
+@pytest.mark.parametrize(
+    ("target_intensity", "reported_intensity", "succeeds"),
+    [(502, 501, True), (500, 499, False)],
+)
+@pytest.mark.asyncio
+async def test_effect_exit_confirms_implicit_target_in_ha_brightness_domain(
+    monkeypatch: pytest.MonkeyPatch,
+    target_intensity: int,
+    reported_intensity: int,
+    succeeds: bool,
+) -> None:
+    """Effect exit accepts quantization but rejects another published brightness."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._state = light_state(is_hsi=False, intensity=target_intensity)
+    light._effect_state = telink.EffectState(
+        on=True,
+        effect=telink.SystemEffect.TV,
+        intensity=200,
+        frequency=5,
+    )
+    status_requests = 0
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        nonlocal status_requests
+        del retries
+        if payload == telink.status_request():
+            status_requests += 1
+            light._on_access_message(
+                access_message(as_report(telink.cct(4300, reported_intensity), on=True))
+            )
+
+    light._async_send = AsyncMock(side_effect=send)
+
+    if succeeds:
+        await light.async_apply_effect("off")
+        assert status_requests == 1
+    else:
+        with pytest.raises(device.AmaranConnectionError, match="leaving its effect"):
+            await light.async_apply_effect("off")
+        assert status_requests == 3
+
+
 @pytest.mark.asyncio
 async def test_steady_parameter_exits_sleeping_effect_and_wakes_last(
     monkeypatch: pytest.MonkeyPatch,
@@ -1137,6 +1659,121 @@ async def test_steady_parameter_exits_sleeping_effect_and_wakes_last(
         telink.cct(3200, 100),
         telink.onoff(True),
     ]
+
+
+@pytest.mark.asyncio
+async def test_steady_turn_on_accepts_one_step_firmware_intensity_quantization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A one-tenth-percent Ace normalization still confirms the HA request."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._state = light_state(is_hsi=False, on=True, intensity=100)
+    status_requests = 0
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        nonlocal status_requests
+        del retries
+        if payload == telink.status_request():
+            status_requests += 1
+            light._on_access_message(
+                access_message(as_report(telink.cct(4500, 501), on=True))
+            )
+
+    light._async_send = AsyncMock(side_effect=send)
+
+    await light.async_apply_turn_on(
+        intensity=502,
+        brightness_changed=True,
+        kelvin=4500,
+    )
+
+    assert status_requests == 1
+    assert light.state is not None and light.state.intensity == 501
+
+
+@pytest.mark.asyncio
+async def test_brightness_only_write_accepts_same_ha_brightness_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Command 15 uses the same user-visible confirmation contract."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._state = light_state(is_hsi=False, on=True, intensity=100)
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        del retries
+        if payload == telink.status_request():
+            light._on_access_message(
+                access_message(as_report(telink.cct(4500, 501), on=True))
+            )
+
+    light._async_send = AsyncMock(side_effect=send)
+
+    await light.async_apply_turn_on(
+        intensity=502,
+        brightness_changed=True,
+    )
+
+    assert [call.args[0] for call in light._async_send.await_args_list] == [
+        telink.brightness(502),
+        telink.status_request(),
+    ]
+    assert light.state is not None and light.state.intensity == 501
+
+
+@pytest.mark.asyncio
+async def test_steady_turn_on_rejects_larger_intensity_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even a one-step raw change must fail across an HA brightness boundary."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._state = light_state(is_hsi=False, on=True, intensity=100)
+    status_requests = 0
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        nonlocal status_requests
+        del retries
+        if payload == telink.status_request():
+            status_requests += 1
+            light._on_access_message(
+                access_message(as_report(telink.cct(4500, 499), on=True))
+            )
+
+    light._async_send = AsyncMock(side_effect=send)
+
+    with pytest.raises(device.AmaranConnectionError, match="requested light state"):
+        await light.async_apply_turn_on(
+            intensity=500,
+            brightness_changed=True,
+            kelvin=4500,
+        )
+
+    assert status_requests == 3
+
+
+@pytest.mark.asyncio
+async def test_steady_turn_on_confirms_truncated_command2_kelvin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Confirmation uses the app's positive-Kelvin integer division."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._state = light_state(is_hsi=False, on=True, intensity=100)
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        del retries
+        if payload == telink.status_request():
+            light._on_access_message(
+                access_message(as_report(telink.cct(4509, 502), on=True))
+            )
+
+    light._async_send = AsyncMock(side_effect=send)
+
+    await light.async_apply_turn_on(
+        intensity=502,
+        brightness_changed=True,
+        kelvin=4509,
+    )
+
+    assert light.state is not None and light.state.kelvin == 4500
 
 
 @pytest.mark.asyncio
@@ -1236,7 +1873,7 @@ async def test_invalid_effect_is_a_controlled_connection_error(
 async def test_cataloged_system_effect2_selects_and_confirms_real_report(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A default-safe command-34 effect is selectable through the light API."""
+    """A default-safe cmd34 effect accepts a brightness-equivalent report."""
     profile = get_fixture_profile_by_product_id("000G5")
     light = make_light(monkeypatch, profile=profile)
     light._proxy = Mock()
@@ -1247,18 +1884,34 @@ async def test_cataloged_system_effect2_selects_and_confirms_real_report(
         nonlocal latest
         del retries
         if payload[9] & 0x7F == systemfx2.CMD_SYSTEM_EFFECT_2:
-            latest = as_report(payload)
+            requested = systemfx2.decode_effect2(payload)
+            assert requested is not None
+            latest = as_report(
+                systemfx2.effect2(
+                    requested.effect,
+                    on=requested.on,
+                    intensity=501,
+                    frequency=requested.frequency,
+                    speed=requested.speed,
+                    mode=requested.mode,
+                    kelvin=requested.kelvin,
+                    gm=requested.gm,
+                    hue=requested.hue,
+                    saturation=requested.saturation,
+                    center_kelvin=requested.center_kelvin,
+                )[0]
+            )
             light._on_access_message(access_message(latest))
         elif payload == telink.status_request() and latest is not None:
             light._on_access_message(access_message(latest))
 
     light._async_send = AsyncMock(side_effect=send)
 
-    await light.async_apply_effect("Lightning II", intensity=321)
+    await light.async_apply_effect("Lightning II", intensity=502)
 
     assert light.effect2_state is not None
     assert light.effect2_state.effect is systemfx2.SystemEffect2.LIGHTNING_II
-    assert light.effect2_state.intensity == 321
+    assert light.effect2_state.intensity == 501
     assert light.effect_state is light.effect2_state
     assert light.available
 
@@ -1352,6 +2005,58 @@ async def test_system_effect2_brightness_rejects_reset_preserved_fields(
 
     with pytest.raises(device.AmaranConnectionError, match="did not confirm"):
         await light.async_apply_turn_on(intensity=500, brightness_changed=True)
+
+
+@pytest.mark.asyncio
+async def test_system_effect2_parameter_accepts_ha_equivalent_intensity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cmd34 parameter rewrite normalizes only its global intensity."""
+    profile = get_fixture_profile_by_product_id("000G5")
+    light = make_light(monkeypatch, profile=profile)
+    initial = as_report(
+        systemfx2.effect2(
+            systemfx2.SystemEffect2.LIGHTNING_II,
+            intensity=502,
+            frequency=5,
+            speed=7,
+            mode=1,
+            hue=120,
+            saturation=75,
+            center_kelvin=5600,
+        )[0]
+    )
+    light._on_access_message(access_message(initial))
+    quantized = as_report(
+        systemfx2.effect2(
+            systemfx2.SystemEffect2.LIGHTNING_II,
+            intensity=501,
+            frequency=8,
+            speed=7,
+            mode=1,
+            hue=120,
+            saturation=75,
+            center_kelvin=5600,
+        )[0]
+    )
+    status_requests = 0
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        nonlocal status_requests
+        del retries
+        if payload == telink.status_request():
+            status_requests += 1
+            light._on_access_message(access_message(quantized))
+
+    light._async_send = AsyncMock(side_effect=send)
+
+    await light.async_set_effect_frequency(8)
+
+    assert status_requests == 1
+    assert light.effect2_state is not None
+    assert light.effect2_state.intensity == 501
+    assert light.effect2_state.frequency == 8
+    assert light.effect2_state.speed == 7
 
 
 @pytest.mark.asyncio
@@ -1791,6 +2496,109 @@ async def test_pixel_brightness_rejects_an_incomplete_reported_program(
     light._async_send.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    ("requested_intensity", "reported_intensity", "succeeds"),
+    [(502, 501, True), (500, 499, False)],
+)
+@pytest.mark.asyncio
+async def test_rainbow_brightness_confirmation_uses_ha_buckets(
+    monkeypatch: pytest.MonkeyPatch,
+    requested_intensity: int,
+    reported_intensity: int,
+    succeeds: bool,
+) -> None:
+    """Rainbow accepts quantization but not another HA brightness value."""
+    light = make_light(monkeypatch, profile=get_fixture_profile_by_product_id("000F5"))
+    initial = pixelfx.effect(pixelfx.PixelEffect.RAINBOW)[0]
+    light._on_access_message(access_message(as_report(initial)))
+    reported = as_report(
+        pixelfx.rainbow(
+            playback=pixelfx.PixelPlayback.RUNNING,
+            brightness=reported_intensity,
+            direction=0,
+            speed=100,
+        )
+    )
+    status_requests = 0
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        nonlocal status_requests
+        del retries
+        if payload == telink.status_request():
+            status_requests += 1
+            light._on_access_message(access_message(reported))
+
+    light._async_send = AsyncMock(side_effect=send)
+
+    if succeeds:
+        await light.async_apply_turn_on(
+            intensity=requested_intensity,
+            brightness_changed=True,
+        )
+        assert status_requests == 1
+        assert light.pixel_state is not None
+        assert light.pixel_state.intensity == reported_intensity
+    else:
+        with pytest.raises(device.AmaranConnectionError, match="did not confirm"):
+            await light.async_apply_turn_on(
+                intensity=requested_intensity,
+                brightness_changed=True,
+            )
+        assert status_requests == 3
+
+
+@pytest.mark.parametrize(
+    ("requested_intensity", "reported_intensity", "succeeds"),
+    [(502, 501, True), (500, 499, False), (502, None, True)],
+)
+@pytest.mark.asyncio
+async def test_multipage_pixel_brightness_confirmation_uses_fresh_pages(
+    monkeypatch: pytest.MonkeyPatch,
+    requested_intensity: int,
+    reported_intensity: int | None,
+    succeeds: bool,
+) -> None:
+    """Fresh color pages are checked; a control-only reply remains supported."""
+    light = make_light(monkeypatch, profile=get_fixture_profile_by_product_id("000F5"))
+    for payload in pixelfx.effect(pixelfx.PixelEffect.COLOR_FADE):
+        light._on_access_message(access_message(as_report(payload)))
+    assert light.pixel_state is not None
+    reported_payloads = device._pixel_payloads(
+        light.pixel_state,
+        intensity=(
+            requested_intensity if reported_intensity is None else reported_intensity
+        ),
+        on=True,
+    )
+    if reported_intensity is None:
+        reported_payloads = (reported_payloads[-1],)
+    status_requests = 0
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        nonlocal status_requests
+        del retries
+        if payload == telink.status_request():
+            status_requests += 1
+            for reported_payload in reported_payloads:
+                light._on_access_message(access_message(as_report(reported_payload)))
+
+    light._async_send = AsyncMock(side_effect=send)
+
+    if succeeds:
+        await light.async_apply_turn_on(
+            intensity=requested_intensity,
+            brightness_changed=True,
+        )
+        assert status_requests == 1
+    else:
+        with pytest.raises(device.AmaranConnectionError, match="did not confirm"):
+            await light.async_apply_turn_on(
+                intensity=requested_intensity,
+                brightness_changed=True,
+            )
+        assert status_requests == 3
+
+
 def test_pixel_continue_page_has_unknown_power_state() -> None:
     """A continuation-only colour page must not be published as on or off."""
     state = device._decode_pixel_sequence(
@@ -2000,6 +2808,28 @@ async def test_boost_tracks_modal_state_without_a_report(
     light._async_send.assert_any_await(telink.boost(True, 4300, 100))
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [False, True])
+async def test_boost_same_modal_state_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    """A redundant modal request must not write or refresh the steady output."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    steady = light_state(is_hsi=False)
+    boost = telink.BoostState(enabled, 4300, 100)
+    light._state = steady
+    light._boost_state = boost
+    light._async_send = AsyncMock()
+    light._async_refresh_state = AsyncMock(return_value=True)
+
+    await light.async_set_boost(enabled)
+
+    light._async_send.assert_not_awaited()
+    light._async_refresh_state.assert_not_awaited()
+    assert light.state is steady
+    assert light.boost_state is boost
+
+
 def test_unsolicited_boost_report_cannot_enable_the_modal_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2072,23 +2902,69 @@ async def test_boost_write_failure_does_not_mutate_cache(
 
 
 @pytest.mark.asyncio
-async def test_fan_same_mode_still_requires_fresh_query_confirmation(
+async def test_fan_same_supported_mode_is_idempotent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A stale cached mode cannot make an unanswered fan write succeed."""
+    """A current report makes re-selecting the supported mode a no-op."""
     light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
     light._fan_state = telink.decode_fan(fan_report(telink.FanMode.SMART))
     light._async_send = AsyncMock()
     light._async_refresh_optional = AsyncMock(return_value=False)
+    sleep = AsyncMock()
+    monkeypatch.setattr(device.asyncio, "sleep", sleep)
+
+    await light.async_set_fan_mode("smart")
+
+    light._async_send.assert_not_awaited()
+    light._async_refresh_optional.assert_not_awaited()
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fan_mode_retries_one_lost_confirmation_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A changed mode succeeds when the second bounded query gets its report."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._fan_state = telink.decode_fan(fan_report(telink.FanMode.SMART))
+    light._async_send = AsyncMock()
+    attempts = 0
+
+    async def refresh(*_args: object) -> bool:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return False
+        light._fan_state = telink.decode_fan(fan_report(telink.FanMode.SILENT))
+        return True
+
+    light._async_refresh_optional = AsyncMock(side_effect=refresh)
+    monkeypatch.setattr(device.asyncio, "sleep", AsyncMock())
+
+    await light.async_set_fan_mode("silent")
+
+    light._async_send.assert_awaited_once_with(telink.fan("silent"))
+    assert light._async_refresh_optional.await_count == 2
+    assert light.fan_state is not None
+    assert light.fan_state.mode is telink.FanMode.SILENT
+
+
+@pytest.mark.asyncio
+async def test_fan_mode_rejects_two_lost_confirmation_reports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A changed mode fails after exactly two unanswered status queries."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._fan_state = telink.decode_fan(fan_report(telink.FanMode.SMART))
+    light._async_send = AsyncMock()
+    light._async_refresh_optional = AsyncMock(side_effect=[False, False])
     monkeypatch.setattr(device.asyncio, "sleep", AsyncMock())
 
     with pytest.raises(device.AmaranConnectionError, match="did not confirm"):
-        await light.async_set_fan_mode("smart")
+        await light.async_set_fan_mode("silent")
 
-    light._async_send.assert_awaited_once_with(telink.fan("smart"))
-    light._async_refresh_optional.assert_awaited_once_with(
-        telink.fan_request(), light._fan_received
-    )
+    light._async_send.assert_awaited_once_with(telink.fan("silent"))
+    assert light._async_refresh_optional.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -2098,14 +2974,25 @@ async def test_manual_fan_mode_preserves_reported_speed(
     """Selecting Manual must not overwrite the known target with zero RPM."""
     light = make_light(monkeypatch, profile=get_fixture_profile_by_product_id("000G5"))
     light._fan_state = telink.FanState(
-        telink.FanMode.MANUAL,
+        telink.FanMode.SMART,
         fixture_speed=650,
         current_temperature_raw=0,
         high_temperature_raw=0,
-        supported_modes=(telink.FanMode.MANUAL,),
+        supported_modes=(telink.FanMode.MANUAL, telink.FanMode.SMART),
     )
     light._async_send = AsyncMock()
-    light._async_refresh_optional = AsyncMock(return_value=True)
+
+    async def refresh(*_args: object) -> bool:
+        light._fan_state = telink.FanState(
+            telink.FanMode.MANUAL,
+            fixture_speed=650,
+            current_temperature_raw=0,
+            high_temperature_raw=0,
+            supported_modes=(telink.FanMode.MANUAL, telink.FanMode.SMART),
+        )
+        return True
+
+    light._async_refresh_optional = AsyncMock(side_effect=refresh)
     monkeypatch.setattr(device.asyncio, "sleep", AsyncMock())
 
     await light.async_set_fan_mode("manual")
@@ -2160,6 +3047,69 @@ async def test_manual_fan_speed_requires_mode_and_fresh_confirmation(
 
 
 @pytest.mark.asyncio
+async def test_manual_fan_speed_retries_one_lost_confirmation_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A manual target succeeds when the retry receives the exact RPM."""
+    light = make_light(monkeypatch, profile=get_fixture_profile_by_product_id("000G5"))
+    light._fan_state = telink.FanState(
+        telink.FanMode.MANUAL,
+        fixture_speed=650,
+        current_temperature_raw=0,
+        high_temperature_raw=0,
+        supported_modes=(telink.FanMode.MANUAL,),
+    )
+    light._async_send = AsyncMock()
+    attempts = 0
+
+    async def refresh(*_args: object) -> bool:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return False
+        light._fan_state = telink.FanState(
+            telink.FanMode.MANUAL,
+            fixture_speed=700,
+            current_temperature_raw=0,
+            high_temperature_raw=0,
+            supported_modes=(telink.FanMode.MANUAL,),
+        )
+        return True
+
+    light._async_refresh_optional = AsyncMock(side_effect=refresh)
+    monkeypatch.setattr(device.asyncio, "sleep", AsyncMock())
+
+    await light.async_set_fan_speed(700)
+
+    light._async_send.assert_awaited_once_with(telink.fan(telink.FanMode.MANUAL, 700))
+    assert light._async_refresh_optional.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_manual_fan_speed_rejects_two_lost_confirmation_reports(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A manual target fails after exactly two unanswered status queries."""
+    light = make_light(monkeypatch, profile=get_fixture_profile_by_product_id("000G5"))
+    light._fan_state = telink.FanState(
+        telink.FanMode.MANUAL,
+        fixture_speed=650,
+        current_temperature_raw=0,
+        high_temperature_raw=0,
+        supported_modes=(telink.FanMode.MANUAL,),
+    )
+    light._async_send = AsyncMock()
+    light._async_refresh_optional = AsyncMock(side_effect=[False, False])
+    monkeypatch.setattr(device.asyncio, "sleep", AsyncMock())
+
+    with pytest.raises(device.AmaranConnectionError, match="did not confirm"):
+        await light.async_set_fan_speed(700)
+
+    light._async_send.assert_awaited_once_with(telink.fan(telink.FanMode.MANUAL, 700))
+    assert light._async_refresh_optional.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_manual_fan_speed_rejects_stale_or_wrong_report(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2178,6 +3128,8 @@ async def test_manual_fan_speed_rejects_stale_or_wrong_report(
 
     with pytest.raises(device.AmaranConnectionError, match="did not confirm"):
         await light.async_set_fan_speed(700)
+
+    assert light._async_refresh_optional.await_count == 2
 
 
 def test_write_form_pages_cannot_confirm_their_own_commands(

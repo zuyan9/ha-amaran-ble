@@ -20,12 +20,14 @@ from .const import (
     CONF_LOCAL_ADDRESS,
     CONF_NET_KEY,
     CONF_SEQUENCE_STORE_ID,
+    CONF_TRANSPORT_ADDRESS,
     CONF_UNICAST_ADDRESS,
 )
 
 _CONFIG_ENTRY_KEYS_TO_REDACT = frozenset(
     {
         CONF_ADDRESS,
+        CONF_TRANSPORT_ADDRESS,
         CONF_NAME,
         CONF_NET_KEY,
         CONF_APP_KEY,
@@ -100,6 +102,9 @@ async def async_get_config_entry_diagnostics(
         "runtime": {
             "connected": device.connected,
             "available": device.available,
+            # Never expose either BLE address. This boolean is sufficient to
+            # prove that cryptographic random-address recovery is in use.
+            "using_alternate_address": device.using_alternate_address,
             "preferred_green_magenta": device.preferred_gm,
             "available_fan_modes": list(device.available_fan_modes),
             "states": {

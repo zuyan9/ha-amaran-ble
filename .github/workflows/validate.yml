@@ -20,13 +20,7 @@ jobs:
       - run: uv sync --all-groups --locked --python 3.14
       - run: uv run ruff check .
       - run: uv run ruff format --check .
-      - run: uv run pytest -q
-      - run: >-
-          uv run
-          --with homeassistant==2026.8.0
-          --with aiousbwatcher==1.1.2
-          --with serialx==1.8.2
-          python -m pytest -q
+      - run: uv run --all-groups pytest -q
       - run: uv run python -m compileall -q custom_components tests
 
   hassfest:

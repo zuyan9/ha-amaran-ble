@@ -772,6 +772,7 @@ def test_decode_legacy_and_protocol_42_power_reports() -> None:
     legacy = bytes.fromhex("6800102cabd039204e0a")
     assert telink.decode_power(legacy) == telink.PowerState(
         source=telink.PowerSource.EXTERNAL,
+        power_state_raw=True,
         battery_percent=85,
         runtime_minutes=300,
         battery_voltage_raw=14800,
@@ -782,12 +783,46 @@ def test_decode_legacy_and_protocol_42_power_reports() -> None:
     state = telink.decode_power(current, protocol_version=42)
     assert state == telink.PowerState(
         source=telink.PowerSource.BATTERY,
+        power_state_raw=False,
         battery_percent=77,
         runtime_minutes=3000,
         battery_voltage_raw=14500,
         external_voltage_raw=0,
     )
     assert telink.decode_report(current, protocol_version=42) == state
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected_source", "expected_power_state_raw", "external_voltage"),
+    [
+        # Live-equivalent Ace 25x report: bit 20 is clear despite a 15 V input.
+        (
+            "7a000000c8b620983a0a",
+            telink.PowerSource.EXTERNAL,
+            False,
+            15000,
+        ),
+        # Deliberately cross the fields in the other direction as well.
+        ("b8001000c8b62000000a", telink.PowerSource.BATTERY, True, 0),
+    ],
+)
+def test_decode_power_source_follows_external_voltage(
+    payload: str,
+    expected_source: telink.PowerSource,
+    expected_power_state_raw: bool,
+    external_voltage: int,
+) -> None:
+    """External voltage, not the independent bit-20 state, selects the source."""
+    state = telink.decode_power(bytes.fromhex(payload), protocol_version=39)
+
+    assert state == telink.PowerState(
+        source=expected_source,
+        power_state_raw=expected_power_state_raw,
+        battery_percent=100,
+        runtime_minutes=0,
+        battery_voltage_raw=8374,
+        external_voltage_raw=external_voltage,
+    )
 
 
 def test_decode_version_report_and_ha_properties() -> None:

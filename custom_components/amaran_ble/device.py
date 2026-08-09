@@ -24,9 +24,17 @@ from homeassistant.helpers.storage import Store
 
 from .amaranble import highspeed, network, pixelfx, systemfx2, telink
 from .amaranble.config_client import ConfigClient
-from .amaranble.gatt import MESH_PROVISIONING_SERVICE, MESH_PROXY_SERVICE
+from .amaranble.gatt import (
+    MESH_PROVISIONING_SERVICE,
+    MESH_PROXY_SERVICE,
+    PROVISIONING_DATA_IN,
+    PROVISIONING_DATA_OUT,
+    PROXY_DATA_IN,
+    PROXY_DATA_OUT,
+)
 from .amaranble.proxy import AccessMessage, ProxyClient, ProxyError
 from .amaranble.sequence import SequenceExhaustedError, SequenceReservation
+from .brightness import intensities_have_same_brightness
 from .const import (
     DOMAIN,
     INITIAL_POLL_INTERVAL,
@@ -36,6 +44,7 @@ from .const import (
     SEQUENCE_CHECKPOINT,
 )
 from .profiles import FixtureProfile
+from .resolver import MeshProxyCandidate, async_mesh_proxy_candidates
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -55,6 +64,30 @@ LEGACY_DUAL_COLOR_EFFECTS = frozenset(
         telink.SystemEffect.WELDING,
     }
 )
+
+
+def _effect_state_matches(
+    report: telink.EffectState | None,
+    expected: telink.EffectState,
+) -> bool:
+    """Compare a command-7 state with HA-equivalent global intensity."""
+    return (
+        report is not None
+        and intensities_have_same_brightness(report.intensity, expected.intensity)
+        and replace(report, intensity=expected.intensity) == expected
+    )
+
+
+def _effect2_state_matches(
+    report: systemfx2.SystemEffect2State | None,
+    expected: systemfx2.SystemEffect2State,
+) -> bool:
+    """Compare a command-34 state with HA-equivalent global intensity."""
+    return (
+        report is not None
+        and intensities_have_same_brightness(report.intensity, expected.intensity)
+        and replace(report, intensity=expected.intensity) == expected
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -358,6 +391,49 @@ class NodeConfigurationError(Exception):
         self.sequence = sequence
 
 
+async def _async_establish_candidate(
+    hass: HomeAssistant,
+    candidate: MeshProxyCandidate,
+    name: str,
+    disconnected_callback: Callable[[BleakClient], None] | None = None,
+) -> BleakClient:
+    """Connect through HA's best current scanner source for one address."""
+    return await establish_connection(
+        BleakClient,
+        candidate.ble_device,
+        name,
+        disconnected_callback,
+        ble_device_callback=lambda: bluetooth.async_ble_device_from_address(
+            hass, candidate.address, connectable=True
+        ),
+        # Provisioning and Proxy are mutually exclusive GATT layouts. A
+        # factory reset changes the services, so an otherwise valid BlueZ
+        # cache can conceal the authoritative provisioning-only bearer.
+        use_services_cache=False,
+    )
+
+
+def _client_exposes_only_provisioning_bearer(client: BleakClient) -> bool:
+    """Return whether fresh GATT discovery proves the node was factory-reset."""
+    try:
+        services = client.services
+        has_complete_provisioning_bearer = (
+            services.get_service(MESH_PROVISIONING_SERVICE) is not None
+            and services.get_characteristic(PROVISIONING_DATA_IN) is not None
+            and services.get_characteristic(PROVISIONING_DATA_OUT) is not None
+        )
+        has_any_proxy_bearer = (
+            services.get_service(MESH_PROXY_SERVICE) is not None
+            or services.get_characteristic(PROXY_DATA_IN) is not None
+            or services.get_characteristic(PROXY_DATA_OUT) is not None
+        )
+    except AttributeError, BleakError, RuntimeError:
+        # An unavailable/incomplete service cache is not proof of reset. The
+        # normal proxy startup below will supply the connection error instead.
+        return False
+    return has_complete_provisioning_bearer and not has_any_proxy_bearer
+
+
 class AmaranLight:
     """Owns the BLE link, the mesh session and the cached light state."""
 
@@ -377,9 +453,16 @@ class AmaranLight:
         iv_index: int,
         initial_sequence: int = 0,
         profile: FixtureProfile,
+        transport_address: str | None = None,
+        on_not_provisioned: Callable[[], None] | None = None,
+        on_provisioned: Callable[[], None] | None = None,
     ) -> None:
         self.hass = hass
+        # This is the stable config-entry, entity, and device-registry identity.
+        # A fixture may advertise through a changing random BLE address, which
+        # is tracked separately and is never allowed to change those IDs.
         self.address = address
+        self._transport_address = transport_address or address
         self.name = name
         self.profile = profile
 
@@ -421,6 +504,14 @@ class AmaranLight:
         self._proxy_cleanup_tasks: set[asyncio.Task] = set()
         self._reconnect_delay = RECONNECT_MIN_DELAY
         self._missed_polls = 0
+        self._on_not_provisioned = on_not_provisioned
+        self._on_provisioned = on_provisioned
+        self._not_provisioned_reported = False
+        # A GATT Proxy bearer alone does not prove that it belongs to this
+        # private mesh: Telink's proxy-filter handshake deliberately tolerates
+        # missing status replies. Only an accepted access-layer primary report
+        # may mark the node recovered, once per membership episode.
+        self._provisioned_reported = False
 
         # Keep the last steady state while a built-in effect is active. That
         # lets selecting HA's ``off`` effect return to the user's previous CCT
@@ -528,6 +619,11 @@ class AmaranLight:
     def connected(self) -> bool:
         """Return whether the current BLE Mesh proxy link is usable."""
         return self._proxy is not None
+
+    @property
+    def using_alternate_address(self) -> bool:
+        """Return whether the last selected transport differs from stable identity."""
+        return self._transport_address.casefold() != self.address.casefold()
 
     @property
     def available_fan_modes(self) -> tuple[str, ...]:
@@ -885,7 +981,7 @@ class AmaranLight:
         for payload in payloads:
             await self._async_send(payload)
         if not await self._async_confirm_primary_state(
-            lambda: self._effect2_state == expected
+            lambda: _effect2_state_matches(self._effect2_state, expected)
         ):
             raise AmaranConnectionError(
                 f"{self.name} did not confirm its effect {error_label}"
@@ -1035,7 +1131,7 @@ class AmaranLight:
                 if preserving_active_effect:
                     # Brightness changes on the currently selected effect must
                     # preserve every reported field we sent back to the light.
-                    return report == expected_effect
+                    return _effect_state_matches(report, expected_effect)
                 # Firmware chooses and normalizes opaque defaults (notably
                 # speed/trigger) when a different effect is selected. Confirm
                 # the user-visible transition without pretending those defaults
@@ -1044,7 +1140,9 @@ class AmaranLight:
                     report is not None
                     and report.on
                     and report.effect is selected
-                    and report.intensity == expected_intensity
+                    and intensities_have_same_brightness(
+                        report.intensity, expected_intensity
+                    )
                 )
 
             if not await self._async_confirm_primary_state(effect_matches):
@@ -1103,18 +1201,32 @@ class AmaranLight:
         if not output_was_on:
             await self.async_turn_on()
 
-        if not await self._async_confirm_primary_state(
-            lambda: (
-                self._pixel_state is not None
-                and self._pixel_state.on
-                and self._pixel_state.effect is selected
-                and self._pixel_page_generations.get((2, 0), 0) > report_generation
-                and (
-                    selected is not pixelfx.PixelEffect.RAINBOW
-                    or self._pixel_state.intensity == expected_intensity
+        def pixel_effect_matches() -> bool:
+            report = self._pixel_state
+            if (
+                report is None
+                or not report.on
+                or report.effect is not selected
+                or self._pixel_page_generations.get((2, 0), 0) <= report_generation
+            ):
+                return False
+            if selected is pixelfx.PixelEffect.RAINBOW:
+                return intensities_have_same_brightness(
+                    report.intensity, expected_intensity
                 )
+            # Most status replies include only the control page, which carries
+            # no brightness. Preserve that proven fallback, but when the
+            # fixture also returns a fresh brightness-bearing colour/base page,
+            # it must project to the brightness requested by Home Assistant.
+            return all(
+                intensities_have_same_brightness(page.brightness, expected_intensity)
+                for page in report.pages
+                if page.brightness is not None
+                and self._pixel_page_generations.get(_pixel_page_key(page), 0)
+                > report_generation
             )
-        ):
+
+        if not await self._async_confirm_primary_state(pixel_effect_matches):
             raise AmaranConnectionError(
                 f"{self.name} did not confirm pixel effect {selected.value}"
             )
@@ -1208,12 +1320,14 @@ class AmaranLight:
         def effect_matches() -> bool:
             report = self._effect2_state
             if preserving_active_effect:
-                return report == expected
+                return _effect2_state_matches(report, expected)
             return (
                 report is not None
                 and report.on
                 and report.effect is selected
-                and report.intensity == expected_intensity
+                and intensities_have_same_brightness(
+                    report.intensity, expected_intensity
+                )
             )
 
         if not await self._async_confirm_primary_state(effect_matches):
@@ -1236,10 +1350,12 @@ class AmaranLight:
                     steady.kelvin, target_intensity, self._preferred_gm
                 )
         elif current is not None:
-            target_intensity = intensity if intensity is not None else current.intensity
+            target_intensity = (
+                intensity if intensity is not None else current.intensity
+            ) or 180
             await self.async_set_cct(
                 self._default_effect_kelvin(),
-                target_intensity or 180,
+                target_intensity,
                 self._preferred_gm,
             )
         else:
@@ -1258,7 +1374,12 @@ class AmaranLight:
                 and self._pixel_state is None
                 and self._state is not None
                 and self._state.on
-                and (intensity is None or self._state.intensity == intensity)
+                and (
+                    target_intensity is None
+                    or intensities_have_same_brightness(
+                        self._state.intensity, target_intensity
+                    )
+                )
             )
         ):
             raise AmaranConnectionError(
@@ -1303,7 +1424,7 @@ class AmaranLight:
             assert expected is not None
             await self._async_send(payload)
             if not await self._async_confirm_primary_state(
-                lambda: self._effect_state == expected
+                lambda: _effect_state_matches(self._effect_state, expected)
             ):
                 raise AmaranConnectionError(
                     f"{self.name} did not confirm its effect rate"
@@ -1342,7 +1463,7 @@ class AmaranLight:
             assert expected is not None
             await self._async_send(payload)
             if not await self._async_confirm_primary_state(
-                lambda: self._effect_state == expected
+                lambda: _effect_state_matches(self._effect_state, expected)
             ):
                 raise AmaranConnectionError(
                     f"{self.name} did not confirm its effect colour temperature"
@@ -1371,7 +1492,7 @@ class AmaranLight:
             assert expected is not None
             await self._async_send(payload)
             if not await self._async_confirm_primary_state(
-                lambda: self._effect_state == expected
+                lambda: _effect_state_matches(self._effect_state, expected)
             ):
                 raise AmaranConnectionError(
                     f"{self.name} did not confirm its effect hue"
@@ -1402,7 +1523,7 @@ class AmaranLight:
             assert expected is not None
             await self._async_send(payload)
             if not await self._async_confirm_primary_state(
-                lambda: self._effect_state == expected
+                lambda: _effect_state_matches(self._effect_state, expected)
             ):
                 raise AmaranConnectionError(
                     f"{self.name} did not confirm its effect saturation"
@@ -1451,7 +1572,7 @@ class AmaranLight:
             assert expected is not None
             await self._async_send(payload)
             if not await self._async_confirm_primary_state(
-                lambda: self._effect_state == expected
+                lambda: _effect_state_matches(self._effect_state, expected)
             ):
                 raise AmaranConnectionError(
                     f"{self.name} did not confirm its effect green/magenta shift"
@@ -1472,7 +1593,7 @@ class AmaranLight:
             assert expected is not None
             await self._async_send(payload)
             if not await self._async_confirm_primary_state(
-                lambda: self._effect_state == expected
+                lambda: _effect_state_matches(self._effect_state, expected)
             ):
                 raise AmaranConnectionError(
                     f"{self.name} did not confirm its effect colour preset"
@@ -1522,7 +1643,7 @@ class AmaranLight:
             assert expected is not None
             await self._async_send(payload)
             if not await self._async_confirm_primary_state(
-                lambda: self._effect_state == expected
+                lambda: _effect_state_matches(self._effect_state, expected)
             ):
                 raise AmaranConnectionError(
                     f"{self.name} did not confirm its effect color mode"
@@ -1533,6 +1654,8 @@ class AmaranLight:
         if not self.profile.supports_boost:
             raise AmaranConnectionError(f"Boost is not enabled for {self.name}")
         async with self._operation_lock:
+            if self._boost_state is not None and self._boost_state.enabled is enabled:
+                return
             await self._async_set_boost_unlocked(enabled)
             await self._async_refresh_state()
 
@@ -1613,6 +1736,12 @@ class AmaranLight:
             raise AmaranConnectionError(f"{mode} is not supported by {self.name}")
         selected = telink.FanMode(mode)
         async with self._operation_lock:
+            if (
+                self._fan_state is not None
+                and self._fan_state.mode is selected
+                and selected in self._fan_state.supported_modes
+            ):
+                return
             needs_capability_report = (
                 self._fan_state is None
                 or selected not in self._fan_state.supported_modes
@@ -1643,18 +1772,18 @@ class AmaranLight:
             # echo lacks capability and temperature fields and is not enough
             # to confirm that the fixture applied the requested mode.
             await asyncio.sleep(FAN_APPLY_SETTLE)
-            confirmed = await self._async_refresh_optional(
-                telink.fan_request(), self._fan_received
-            )
-            if (
-                not confirmed
-                or self._fan_state is None
-                or self._fan_state.mode is not selected
-                or selected not in self._fan_state.supported_modes
-            ):
-                raise AmaranConnectionError(
-                    f"{self.name} did not confirm fan mode {mode}"
+            for _ in range(2):
+                confirmed = await self._async_refresh_optional(
+                    telink.fan_request(), self._fan_received
                 )
+                if (
+                    confirmed
+                    and self._fan_state is not None
+                    and self._fan_state.mode is selected
+                    and selected in self._fan_state.supported_modes
+                ):
+                    return
+            raise AmaranConnectionError(f"{self.name} did not confirm fan mode {mode}")
 
     async def async_set_fan_speed(self, speed_rpm: float) -> None:
         """Set and confirm the target speed while Manual fan mode is active."""
@@ -1683,19 +1812,21 @@ class AmaranLight:
             self._fan_received.clear()
             await self._async_send(telink.fan(telink.FanMode.MANUAL, target))
             await asyncio.sleep(FAN_APPLY_SETTLE)
-            confirmed = await self._async_refresh_optional(
-                telink.fan_request(), self._fan_received
-            )
-            if (
-                not confirmed
-                or self._fan_state is None
-                or self._fan_state.mode is not telink.FanMode.MANUAL
-                or self._fan_state.fixture_speed != target
-                or telink.FanMode.MANUAL not in self._fan_state.supported_modes
-            ):
-                raise AmaranConnectionError(
-                    f"{self.name} did not confirm manual fan speed {target} RPM"
+            for _ in range(2):
+                confirmed = await self._async_refresh_optional(
+                    telink.fan_request(), self._fan_received
                 )
+                if (
+                    confirmed
+                    and self._fan_state is not None
+                    and self._fan_state.mode is telink.FanMode.MANUAL
+                    and self._fan_state.fixture_speed == target
+                    and telink.FanMode.MANUAL in self._fan_state.supported_modes
+                ):
+                    return
+            raise AmaranConnectionError(
+                f"{self.name} did not confirm manual fan speed {target} RPM"
+            )
 
     async def async_apply_turn_on(
         self,
@@ -1771,7 +1902,7 @@ class AmaranLight:
                     await self.async_turn_on()
                     expected_effect = replace(expected_effect, on=True)
                 if not await self._async_confirm_primary_state(
-                    lambda: self._effect_state == expected_effect
+                    lambda: _effect_state_matches(self._effect_state, expected_effect)
                 ):
                     raise AmaranConnectionError(
                         f"{self.name} did not confirm its effect state"
@@ -1800,7 +1931,9 @@ class AmaranLight:
                     or not current.on
                 ):
                     return False
-                if current.intensity != intensity and (
+                if not intensities_have_same_brightness(
+                    current.intensity, intensity
+                ) and (
                     brightness_changed or hs_color is not None or kelvin is not None
                 ):
                     return False
@@ -1811,7 +1944,9 @@ class AmaranLight:
                         and current.saturation == math.floor(hs_color[1] + 0.5)
                     )
                 if kelvin is not None:
-                    expected_kelvin = int((kelvin + 5) // 10) * 10
+                    # The app truncates positive Kelvin to the command-2 wire's
+                    # ten-Kelvin resolution before sending it.
+                    expected_kelvin = int(kelvin // 10) * 10
                     return (
                         not current.is_hsi
                         and current.kelvin == expected_kelvin
@@ -1914,7 +2049,9 @@ class AmaranLight:
                         self._state is not None
                         and not self._state.is_hsi
                         and self._state.kelvin == state.kelvin
-                        and self._state.intensity == state.intensity
+                        and intensities_have_same_brightness(
+                            self._state.intensity, state.intensity
+                        )
                         and self._state.gm == target
                         and self._state.on == state.on
                     )
@@ -2031,96 +2168,59 @@ class AmaranLight:
             if self._proxy is not None:
                 return
 
-            ble_device = bluetooth.async_ble_device_from_address(
-                self.hass, self.address, connectable=True
+            candidates = async_mesh_proxy_candidates(
+                self.hass,
+                self.address,
+                net_key=self._net_key,
+                unicast_address=self._unicast_address,
+                transport_address=self._transport_address,
             )
-            if ble_device is None:
-                if self._looks_unprovisioned():
-                    raise AmaranNotProvisionedError(self.address)
+            if not candidates:
                 raise AmaranConnectionError(f"{self.address} is not in range")
 
-            _LOGGER.debug("connecting to %s", self.address)
-            try:
-                client = await establish_connection(
-                    BleakClient,
-                    ble_device,
-                    self.name,
-                    self._on_disconnected,
-                    ble_device_callback=lambda: bluetooth.async_ble_device_from_address(
-                        self.hass, self.address, connectable=True
-                    ),
-                )
-            except (BleakError, TimeoutError) as err:
-                raise AmaranConnectionError(
-                    f"could not connect to {self.address}: {err}"
-                ) from err
-
-            if self._closing:
-                await self._close_client(client)
-                raise AmaranConnectionError(f"{self.name} is shutting down")
-
-            # Install the identity before starting notifications so a
-            # disconnect -- or even malformed stored key material rejected by
-            # ProxyClient construction -- cannot leak an unowned BLE client or
-            # be mistaken for a stale callback from an older connection.
-            self._client = client
-            proxy: ProxyClient | None = None
-            try:
-                proxy = ProxyClient(
-                    client,
-                    net_key=self._net_key,
-                    app_key=self._app_key,
-                    device_keys={self._unicast_address: self._device_key},
-                    local_address=self._local_address,
-                    iv_index=self._iv_index,
-                    sequence=self._sequence,
-                    on_message=self._on_access_message,
-                    on_sequence=self._on_sequence,
-                    before_sequence=self._async_before_sequence,
-                    replay_list=self._inbound_replay_list,
-                    reassembler=self._segment_reassembler,
-                )
-                await proxy.start(subscribe_addresses=[self._unicast_address])
-            except BaseException as err:
-                if self._client is client:
-                    self._client = None
+            last_error: AmaranConnectionError | None = None
+            for candidate in candidates:
                 try:
-                    if proxy is not None:
-                        with contextlib.suppress(Exception):
-                            await proxy.stop()
-                finally:
-                    await self._close_client(client)
-                if isinstance(err, asyncio.CancelledError):
-                    raise
-                if isinstance(err, (BleakError, OSError, TimeoutError)):
-                    if self._looks_unprovisioned():
-                        raise AmaranNotProvisionedError(self.address) from err
-                    raise AmaranConnectionError(
-                        f"{self.address} did not expose the mesh proxy service: {err}"
-                    ) from err
-                if isinstance(
-                    err,
-                    (AmaranConnectionError, ProxyError, SequenceExhaustedError),
-                ):
-                    raise AmaranConnectionError(str(err)) from err
-                raise
+                    client, proxy = await self._async_connect_candidate(candidate)
+                except AmaranConnectionError as err:
+                    if self._closing:
+                        raise
+                    last_error = err
+                    continue
 
-            if self._closing or self._client is not client or not client.is_connected:
-                with contextlib.suppress(Exception):
-                    await proxy.stop()
-                if self._client is client:
-                    self._client = None
-                await self._close_client(client)
-                if self._closing:
-                    raise AmaranConnectionError(f"{self.name} is shutting down")
-                raise AmaranConnectionError(
-                    f"{self.address} disconnected while setting up its mesh proxy"
+                if (
+                    self._closing
+                    or self._client is not client
+                    or not client.is_connected
+                ):
+                    with contextlib.suppress(Exception):
+                        await proxy.stop()
+                    if self._client is client:
+                        self._client = None
+                    await self._close_client(client)
+                    if self._closing:
+                        raise AmaranConnectionError(f"{self.name} is shutting down")
+                    last_error = AmaranConnectionError(
+                        f"{self.address} disconnected while setting up its mesh proxy"
+                    )
+                    continue
+
+                self._proxy = proxy
+                self._transport_address = candidate.address
+                self._reconnect_delay = RECONNECT_MIN_DELAY
+                self._missed_polls = 0
+                _LOGGER.debug(
+                    "connected to %s%s",
+                    self.address,
+                    " through an alternate BLE address"
+                    if self.using_alternate_address
+                    else "",
                 )
-            assert proxy is not None
-            self._proxy = proxy
-            self._reconnect_delay = RECONNECT_MIN_DELAY
-            self._missed_polls = 0
-            _LOGGER.debug("connected to %s", self.address)
+                break
+            else:
+                if last_error is not None:
+                    raise last_error
+                raise AmaranConnectionError(f"{self.address} is not in range")
 
         # Prime the cached state; without a report the entity stays unavailable.
         # Optional report pages are deliberately best-effort: a firmware that
@@ -2129,6 +2229,87 @@ class AmaranLight:
             await self._async_refresh_state()
         with contextlib.suppress(AmaranConnectionError):
             await self._async_refresh_diagnostics(include_version=True)
+
+    async def _async_connect_candidate(
+        self, candidate: MeshProxyCandidate
+    ) -> tuple[BleakClient, ProxyClient]:
+        """Connect one pre-validated route and install its Mesh proxy transport."""
+        _LOGGER.debug(
+            "connecting to %s%s",
+            self.address,
+            " through an alternate BLE address"
+            if candidate.address.casefold() != self.address.casefold()
+            else "",
+        )
+        try:
+            client = await _async_establish_candidate(
+                self.hass,
+                candidate,
+                self.name,
+                self._on_disconnected,
+            )
+        except (BleakError, TimeoutError) as err:
+            raise AmaranConnectionError(
+                f"could not connect to {self.address}: {err}"
+            ) from err
+
+        if self._closing:
+            await self._close_client(client)
+            raise AmaranConnectionError(f"{self.name} is shutting down")
+
+        # Advertisement caches are additive: after a factory reset HA can
+        # briefly retain the old matching 0x1828 data beside a fresh 0x1827
+        # advertisement. Freshly resolved GATT services are authoritative.
+        if _client_exposes_only_provisioning_bearer(client):
+            await self._close_client(client)
+            self._notify_not_provisioned()
+            raise AmaranNotProvisionedError(self.address)
+
+        # Install the identity before starting notifications so a disconnect
+        # -- or even malformed stored key material rejected by ProxyClient
+        # construction -- cannot leak an unowned BLE client or be mistaken for
+        # a stale callback from an older connection.
+        self._client = client
+        proxy: ProxyClient | None = None
+        try:
+            proxy = ProxyClient(
+                client,
+                net_key=self._net_key,
+                app_key=self._app_key,
+                device_keys={self._unicast_address: self._device_key},
+                local_address=self._local_address,
+                iv_index=self._iv_index,
+                sequence=self._sequence,
+                on_message=self._on_access_message,
+                on_sequence=self._on_sequence,
+                before_sequence=self._async_before_sequence,
+                replay_list=self._inbound_replay_list,
+                reassembler=self._segment_reassembler,
+            )
+            await proxy.start(subscribe_addresses=[self._unicast_address])
+        except BaseException as err:
+            if self._client is client:
+                self._client = None
+            try:
+                if proxy is not None:
+                    with contextlib.suppress(Exception):
+                        await proxy.stop()
+            finally:
+                await self._close_client(client)
+            if isinstance(err, asyncio.CancelledError):
+                raise
+            if isinstance(err, (BleakError, OSError, TimeoutError)):
+                raise AmaranConnectionError(
+                    f"{self.address} did not expose the mesh proxy service: {err}"
+                ) from err
+            if isinstance(
+                err,
+                (AmaranConnectionError, ProxyError, SequenceExhaustedError),
+            ):
+                raise AmaranConnectionError(str(err)) from err
+            raise
+
+        return client, proxy
 
     async def _async_disconnect(self) -> None:
         proxy, client = self._proxy, self._client
@@ -2266,6 +2447,7 @@ class AmaranLight:
                 async with self._operation_lock:
                     await self._async_connect()
             except AmaranNotProvisionedError:
+                self._notify_not_provisioned()
                 # Bluetooth service-data caches can be stale. Back off instead
                 # of permanently terminalizing the entry, so a transient proxy
                 # failure followed by a fresh 0x1828 advertisement self-heals.
@@ -2331,19 +2513,42 @@ class AmaranLight:
                 )
                 await self._async_drop_failed_connection(proxy)
 
-    def _looks_unprovisioned(self) -> bool:
-        """True when the fixture advertises provisioning but not proxy service.
+    @callback
+    def _notify_not_provisioned(self) -> None:
+        """Report loss of mesh membership once per failure episode."""
+        if self._not_provisioned_reported:
+            return
+        self._not_provisioned_reported = True
+        self._provisioned_reported = False
+        if self._on_not_provisioned is None:
+            return
+        try:
+            self._on_not_provisioned()
+        except Exception:
+            _LOGGER.exception(
+                "not-provisioned callback for %s failed",
+                self.address,
+            )
 
-        A factory reset (or a re-pair with the amaran app) puts the fixture back
-        into this state, and no key we hold will work on it again.
-        """
-        info = bluetooth.async_last_service_info(self.hass, self.address, False)
-        if info is None:
-            return False
-        return (
-            MESH_PROVISIONING_SERVICE in info.service_data
-            and MESH_PROXY_SERVICE not in info.service_data
-        )
+    @callback
+    def _notify_provisioned(self) -> None:
+        """Report one recovery proven by an authenticated primary report."""
+        if self._provisioned_reported:
+            return
+        if self._on_provisioned is None:
+            self._provisioned_reported = True
+            self._not_provisioned_reported = False
+            return
+        try:
+            self._on_provisioned()
+        except Exception:
+            _LOGGER.exception(
+                "provisioned callback for %s failed",
+                self.address,
+            )
+            return
+        self._provisioned_reported = True
+        self._not_provisioned_reported = False
 
     # ─── Messaging ───────────────────────────────────────────────────────────
 
@@ -2406,6 +2611,7 @@ class AmaranLight:
             return
 
         changed = False
+        primary_report = False
         if isinstance(report, telink.LightState):
             previous_gm = self._preferred_gm
             previous_boost = self._boost_state
@@ -2437,6 +2643,7 @@ class AmaranLight:
             self._pixel_page_generations.clear()
             self._missed_polls = 0
             self._state_received.set()
+            primary_report = True
         elif isinstance(report, telink.EffectState):
             if report.effect.value not in self.profile.effects:
                 return
@@ -2462,6 +2669,7 @@ class AmaranLight:
             self._pixel_page_generations.clear()
             self._missed_polls = 0
             self._state_received.set()
+            primary_report = True
         elif isinstance(report, systemfx2.SystemEffect2State):
             if report.effect.value not in self.profile.system_effects2:
                 return
@@ -2487,6 +2695,7 @@ class AmaranLight:
             self._pixel_page_generations.clear()
             self._missed_polls = 0
             self._state_received.set()
+            primary_report = True
         elif isinstance(report, pixelfx.PixelEffectState):
             if report.effect.value not in self.profile.pixel_effects:
                 return
@@ -2510,6 +2719,7 @@ class AmaranLight:
             self._effect2_state = None
             self._missed_polls = 0
             self._state_received.set()
+            primary_report = True
         elif isinstance(report, telink.BoostState):
             if not self.profile.supports_boost:
                 return
@@ -2551,6 +2761,13 @@ class AmaranLight:
             changed = report != self._high_speed_state
             self._high_speed_state = report
             self._high_speed_received.set()
+
+        # ProxyClient delivered this only after decrypting the private NetKey
+        # and AppKey, and the accepted source is this node's unicast address.
+        # Optional report pages are deliberately insufficient: require one of
+        # the primary state families that makes the light entity available.
+        if primary_report:
+            self._notify_provisioned()
 
         # Always release the matching waiter; an unchanged report still proves
         # the fixture answered the request.
@@ -2602,6 +2819,7 @@ async def async_release_node(
     sequence_store_id: str,
     compatibility_sequence_store_id: str | None = None,
     minimum_sequence: int = 0,
+    transport_address: str | None = None,
 ) -> bool:
     """Factory-reset the node so it stops belonging to our mesh.
 
@@ -2610,69 +2828,85 @@ async def async_release_node(
     owner would have to reset it by hand before Home Assistant or the amaran
     app could adopt it again.
     """
-    ble_device = bluetooth.async_ble_device_from_address(
-        hass, address, connectable=True
+    candidates = async_mesh_proxy_candidates(
+        hass,
+        address,
+        net_key=net_key,
+        unicast_address=unicast_address,
+        transport_address=transport_address,
     )
-    if ble_device is None:
+    if not candidates:
         return False
 
-    client = await establish_connection(BleakClient, ble_device, address)
-    try:
-        store = _sequence_store(hass, sequence_store_id)
-        compatibility_sequence_store_id = (
-            compatibility_sequence_store_id or sequence_store_id
-        )
-        compatibility_store = (
-            None
-            if compatibility_sequence_store_id == sequence_store_id
-            else _sequence_store(hass, compatibility_sequence_store_id)
+    store = _sequence_store(hass, sequence_store_id)
+    compatibility_sequence_store_id = (
+        compatibility_sequence_store_id or sequence_store_id
+    )
+    compatibility_store = (
+        None
+        if compatibility_sequence_store_id == sequence_store_id
+        else _sequence_store(hass, compatibility_sequence_store_id)
+    )
+
+    async def save(data: dict[str, int]) -> None:
+        await _async_save_sequence_stores(
+            hass,
+            sequence_store_id,
+            store,
+            compatibility_sequence_store_id,
+            compatibility_store,
+            data,
         )
 
-        async def save(data: dict[str, int]) -> None:
-            await _async_save_sequence_stores(
-                hass,
-                sequence_store_id,
-                store,
-                compatibility_sequence_store_id,
-                compatibility_store,
-                data,
-            )
-
-        reservation = SequenceReservation.create(
-            await _async_load_sequence_stores(store, compatibility_store),
-            save,
-            block_size=SEQUENCE_CHECKPOINT,
-            minimum_sequence=minimum_sequence,
-        )
-        proxy = ProxyClient(
-            client,
-            net_key=net_key,
-            app_key=app_key,
-            device_keys={unicast_address: device_key},
-            local_address=local_address,
-            iv_index=iv_index,
-            sequence=reservation.next_sequence,
-            on_sequence=reservation.mark_next,
-            before_sequence=reservation.ensure_reserved,
-        )
-        await proxy.start(subscribe_addresses=[unicast_address])
+    reservation = SequenceReservation.create(
+        await _async_load_sequence_stores(store, compatibility_store),
+        save,
+        block_size=SEQUENCE_CHECKPOINT,
+        minimum_sequence=minimum_sequence,
+    )
+    last_error: BaseException | None = None
+    for candidate in candidates:
         try:
+            client = await _async_establish_candidate(hass, candidate, address)
+        except (BleakError, TimeoutError) as err:
+            last_error = err
+            continue
+        proxy: ProxyClient | None = None
+        try:
+            proxy = ProxyClient(
+                client,
+                net_key=net_key,
+                app_key=app_key,
+                device_keys={unicast_address: device_key},
+                local_address=local_address,
+                iv_index=iv_index,
+                sequence=reservation.next_sequence,
+                on_sequence=reservation.mark_next,
+                before_sequence=reservation.ensure_reserved,
+            )
+            await proxy.start(subscribe_addresses=[unicast_address])
             reset_acknowledged = await ConfigClient(proxy, unicast_address).node_reset()
             # Many nodes reset before their status reaches the proxy. In that
-            # case a link drop is the positive signal that the command took.
+            # case a link drop positively confirms the command.
             for _ in range(30):
                 if not client.is_connected:
                     break
                 await asyncio.sleep(0.1)
-            reset_confirmed = reset_acknowledged or not client.is_connected
+            if reset_acknowledged or not client.is_connected:
+                return True
+        except (BleakError, OSError, TimeoutError, ProxyError) as err:
+            last_error = err
         finally:
-            with contextlib.suppress(Exception):
-                await proxy.stop()
-    finally:
-        with contextlib.suppress(Exception, TimeoutError):
-            async with asyncio.timeout(DISCONNECT_TIMEOUT):
-                await client.disconnect()
-    return reset_confirmed
+            if proxy is not None:
+                with contextlib.suppress(Exception):
+                    await proxy.stop()
+            with contextlib.suppress(Exception, TimeoutError):
+                async with asyncio.timeout(DISCONNECT_TIMEOUT):
+                    await client.disconnect()
+
+    if last_error is not None:
+        raise last_error
+    return False
 
 
 async def async_configure_node(
@@ -2754,59 +2988,73 @@ async def async_configure_stored_node(
     sequence: int,
     sequence_store_id: str,
     compatibility_sequence_store_id: str | None = None,
+    transport_address: str | None = None,
 ) -> int:
     """Resume post-provision configuration retained in a config entry."""
-    ble_device = bluetooth.async_ble_device_from_address(
-        hass, address, connectable=True
+    candidates = async_mesh_proxy_candidates(
+        hass,
+        address,
+        net_key=net_key,
+        unicast_address=unicast_address,
+        transport_address=transport_address,
     )
-    if ble_device is None:
+    if not candidates:
         raise AmaranConnectionError(f"{address} is not in range")
 
-    try:
-        client = await establish_connection(BleakClient, ble_device, name)
-    except (BleakError, TimeoutError) as err:
-        raise AmaranConnectionError(f"could not connect to {address}: {err}") from err
+    store = _sequence_store(hass, sequence_store_id)
+    compatibility_sequence_store_id = (
+        compatibility_sequence_store_id or sequence_store_id
+    )
+    compatibility_store = (
+        None
+        if compatibility_sequence_store_id == sequence_store_id
+        else _sequence_store(hass, compatibility_sequence_store_id)
+    )
 
-    try:
-        store = _sequence_store(hass, sequence_store_id)
-        compatibility_sequence_store_id = (
-            compatibility_sequence_store_id or sequence_store_id
-        )
-        compatibility_store = (
-            None
-            if compatibility_sequence_store_id == sequence_store_id
-            else _sequence_store(hass, compatibility_sequence_store_id)
+    async def save(data: dict[str, int]) -> None:
+        await _async_save_sequence_stores(
+            hass,
+            sequence_store_id,
+            store,
+            compatibility_sequence_store_id,
+            compatibility_store,
+            data,
         )
 
-        async def save(data: dict[str, int]) -> None:
-            await _async_save_sequence_stores(
-                hass,
-                sequence_store_id,
-                store,
-                compatibility_sequence_store_id,
-                compatibility_store,
-                data,
+    reservation = SequenceReservation.create(
+        await _async_load_sequence_stores(store, compatibility_store),
+        save,
+        block_size=SEQUENCE_CHECKPOINT,
+        minimum_sequence=sequence,
+    )
+    last_error: AmaranConnectionError | NodeConfigurationError | None = None
+    for candidate in candidates:
+        try:
+            client = await _async_establish_candidate(hass, candidate, name)
+        except (BleakError, TimeoutError) as err:
+            last_error = AmaranConnectionError(f"could not connect to {address}: {err}")
+            continue
+        try:
+            if _client_exposes_only_provisioning_bearer(client):
+                raise AmaranNotProvisionedError(address)
+            return await async_configure_node(
+                client,
+                net_key=net_key,
+                app_key=app_key,
+                device_key=device_key,
+                unicast_address=unicast_address,
+                local_address=local_address,
+                iv_index=iv_index,
+                sequence=reservation.next_sequence,
+                on_sequence=reservation.mark_next,
+                before_sequence=reservation.ensure_reserved,
             )
+        except NodeConfigurationError as err:
+            last_error = err
+        finally:
+            with contextlib.suppress(Exception, TimeoutError):
+                async with asyncio.timeout(DISCONNECT_TIMEOUT):
+                    await client.disconnect()
 
-        reservation = SequenceReservation.create(
-            await _async_load_sequence_stores(store, compatibility_store),
-            save,
-            block_size=SEQUENCE_CHECKPOINT,
-            minimum_sequence=sequence,
-        )
-        return await async_configure_node(
-            client,
-            net_key=net_key,
-            app_key=app_key,
-            device_key=device_key,
-            unicast_address=unicast_address,
-            local_address=local_address,
-            iv_index=iv_index,
-            sequence=reservation.next_sequence,
-            on_sequence=reservation.mark_next,
-            before_sequence=reservation.ensure_reserved,
-        )
-    finally:
-        with contextlib.suppress(Exception, TimeoutError):
-            async with asyncio.timeout(DISCONNECT_TIMEOUT):
-                await client.disconnect()
+    assert last_error is not None
+    raise last_error

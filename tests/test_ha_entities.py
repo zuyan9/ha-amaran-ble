@@ -6,9 +6,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-
-pytest.importorskip("homeassistant")
-
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
     ATTR_COLOR_TEMP_KELVIN,
@@ -772,6 +769,26 @@ def test_power_and_version_sensor_metadata_and_values() -> None:
     assert fan_temperature.native_value == 31
     assert fan_temperature.native_unit_of_measurement is UnitOfTemperature.CELSIUS
     assert fan_temperature.extra_state_attributes == {"high_temperature": False}
+
+
+@pytest.mark.parametrize(
+    ("reported_percent", "expected_percent"),
+    [(0, 0), (100, 100), (101, 100), (127, 100)],
+)
+def test_battery_sensor_caps_seven_bit_report_at_100_percent(
+    reported_percent: int, expected_percent: int
+) -> None:
+    """Seven-bit fixture values follow the app's full-battery presentation."""
+    entry = make_entry(
+        {CONF_MODEL: PROFILE_ACE_25X},
+        available=True,
+        power_state=SimpleNamespace(battery_percent=reported_percent),
+    )
+
+    battery = sensor.AmaranBatteryEntity(entry)
+
+    assert battery.available
+    assert battery.native_value == expected_percent
 
 
 def test_optional_entities_do_not_depend_on_primary_light_report() -> None:

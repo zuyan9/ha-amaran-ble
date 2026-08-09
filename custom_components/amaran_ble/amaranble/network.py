@@ -6,9 +6,11 @@ go into a Proxy PDU. No I/O, so it can be exercised without a fixture present.
 
 from __future__ import annotations
 
+import hmac
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import IntEnum
 
 from cryptography.exceptions import InvalidTag
 
@@ -31,6 +33,13 @@ MAX_COMPLETED_REASSEMBLIES = 64
 
 class NetworkDecodeError(Exception):
     """A received PDU was not addressed to this network, or failed its MIC."""
+
+
+class ProxyIdentityMatch(IntEnum):
+    """Strength of a Mesh Proxy service-data identity match."""
+
+    NETWORK_ID = 1
+    NODE_IDENTITY = 2
 
 
 @dataclass(frozen=True)
@@ -64,22 +73,38 @@ class NetworkKeys:
         A freshly provisioned node advertises this for 60s; matching it is how
         we tell which fixture a MAC-less advertisement belongs to.
         """
-        if len(service_data) < 17 or service_data[0] != 0x01:
+        if len(service_data) != 17 or service_data[0] != 0x01:
             return False
         hash_value, random_value = service_data[1:9], service_data[9:17]
         expected = crypto.aes_ecb(
             self.identity_key,
             b"\x00" * 6 + random_value + address.to_bytes(2, "big"),
         )[8:]
-        return expected == hash_value
+        return hmac.compare_digest(expected, hash_value)
 
     def network_id_matches(self, service_data: bytes) -> bool:
         """Check a Mesh Proxy "Network ID" advertisement against this network."""
         return (
-            len(service_data) >= 9
+            len(service_data) == 9
             and service_data[0] == 0x00
-            and service_data[1:9] == self.network_id
+            and hmac.compare_digest(service_data[1:9], self.network_id)
         )
+
+    def proxy_identity_match(
+        self, service_data: bytes, address: int
+    ) -> ProxyIdentityMatch | None:
+        """Classify service data that proves membership in this mesh.
+
+        Node Identity binds the advertisement to one unicast node. Network ID
+        proves only subnet membership, which is sufficient for this
+        integration because every config entry creates a private one-node
+        subnet.
+        """
+        if self.node_identity_matches(service_data, address):
+            return ProxyIdentityMatch.NODE_IDENTITY
+        if self.network_id_matches(service_data):
+            return ProxyIdentityMatch.NETWORK_ID
+        return None
 
 
 @dataclass(frozen=True)

@@ -30,8 +30,10 @@ No amaran account, vendor cloud service, MQTT, or vendor bridge is required.
   plus seven multi-zone pixel effects
 - Profile-gated Boost, reported fan modes and manual fan speed, power/runtime,
   firmware diagnostics, and high-speed-photography controls
-- Live state updates, automatic reconnection, and crash-safe Bluetooth Mesh
-  sequence handling
+- Live state updates, cryptographically verified reconnection across Bluetooth
+  address changes, and crash-safe provisioning and Mesh sequence handling
+- Home Assistant Repairs support to re-provision a factory-reset fixture in
+  place without replacing its device or entity IDs
 - Setup and model/capability options through the Home Assistant UI
 
 Some effects flash rapidly. Use Strobe, Lightning, Explosion, Paparazzi, and
@@ -86,9 +88,25 @@ profile-specific entities.
   factory-reset it and try again.
 - **Entity unavailable:** confirm the light is powered on and that the adapter
   or proxy supports active Bluetooth connections.
+- **Fixture was factory reset:** open the Home Assistant Repair shown for the
+  integration and select the reset fixture. Home Assistant re-provisions it in
+  place, preserving the existing device and entity IDs.
 - **Removing a light:** keep it powered on and in range while deleting the
   integration so Home Assistant can release it from the private mesh. If that
   cannot complete, factory-reset the fixture before pairing it again.
 - **Reporting experimental hardware issues:** download the integration's
   diagnostics and use the repository's hardware bug-report form. Inspect every
   attachment and redact full MAC addresses and Mesh keys before posting it.
+
+## Development
+
+The locked test environment includes the integration's minimum supported Home
+Assistant release, so Home Assistant-facing tests run locally instead of being
+silently skipped:
+
+```console
+uv sync --locked
+uv run pytest -q
+uv run ruff check .
+uv run ruff format --check .
+```

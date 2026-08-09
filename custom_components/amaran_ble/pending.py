@@ -42,6 +42,30 @@ async def async_get_pending(hass: HomeAssistant, address: str) -> dict[str, Any]
     return dict(record) if record is not None else None
 
 
+async def async_get_pending_records(
+    hass: HomeAssistant,
+) -> dict[str, dict[str, Any]]:
+    """Return every structurally readable recovery record by stable address.
+
+    Provisioned Mesh nodes may resume advertising through a different Bluetooth
+    address after the irreversible Provisioning Data PDU.  Callers can use this
+    snapshot to identify an otherwise orphaned record cryptographically; the
+    records remain keyed by their original address so that key is still the
+    stable config-entry and entity identity.
+    """
+    stored = await _store(hass).async_load() or {}
+    if not isinstance(stored, dict):
+        return {}
+    fixtures = stored.get("fixtures", {})
+    if not isinstance(fixtures, dict):
+        return {}
+    return {
+        address: dict(record)
+        for address, record in fixtures.items()
+        if isinstance(address, str) and address and isinstance(record, dict)
+    }
+
+
 async def async_save_pending(
     hass: HomeAssistant, address: str, record: dict[str, Any]
 ) -> None:
