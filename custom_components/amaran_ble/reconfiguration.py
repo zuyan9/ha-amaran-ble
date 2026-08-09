@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import hmac
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from homeassistant.components import bluetooth
@@ -14,11 +15,14 @@ from homeassistant.core import HomeAssistant, callback
 from .amaranble.gatt import MESH_PROVISIONING_SERVICE, MESH_PROXY_SERVICE
 from .amaranble.network import NetworkKeys
 from .const import (
+    CONF_APP_KEY,
+    CONF_DEVICE_KEY,
     CONF_NET_KEY,
     CONF_TRANSPORT_ADDRESS,
     CONF_UNICAST_ADDRESS,
     NODE_ADDRESS,
 )
+from .pending import async_get_pending
 
 
 def _service_data(info: BluetoothServiceInfoBleak, service_uuid: str) -> bytes | None:
@@ -34,7 +38,69 @@ def _service_data(info: BluetoothServiceInfoBleak, service_uuid: str) -> bytes |
     )
 
 
-def async_reprovision_candidates(
+def _stored_key(data: Mapping[str, Any], key: str) -> bytes | None:
+    """Decode one complete stored Mesh key without trusting its shape."""
+    value = data.get(key)
+    if not isinstance(value, str):
+        return None
+    try:
+        decoded = bytes.fromhex(value)
+    except ValueError:
+        return None
+    return decoded if len(decoded) == 16 else None
+
+
+async def _pending_replacement_identity(
+    hass: HomeAssistant, entry: ConfigEntry
+) -> tuple[NetworkKeys, int] | None:
+    """Return pending subnet identity only for a real replacement transaction."""
+    stable_address = entry.data.get(CONF_ADDRESS)
+    if not isinstance(stable_address, str):
+        return None
+    try:
+        record = await async_get_pending(hass, stable_address)
+    except AttributeError, OSError, TypeError, ValueError:
+        # A missing or unreadable recovery copy must not hide a genuine reset
+        # advertisement. It only makes Proxy recovery ineligible.
+        return None
+    if not isinstance(record, Mapping):
+        return None
+    pending = record.get("data")
+    if not isinstance(pending, Mapping):
+        return None
+
+    current_net_key = _stored_key(entry.data, CONF_NET_KEY)
+    current_app_key = _stored_key(entry.data, CONF_APP_KEY)
+    current_device_key = _stored_key(entry.data, CONF_DEVICE_KEY)
+    pending_net_key = _stored_key(pending, CONF_NET_KEY)
+    pending_app_key = _stored_key(pending, CONF_APP_KEY)
+    pending_device_key = _stored_key(pending, CONF_DEVICE_KEY)
+    if (
+        current_net_key is None
+        or current_app_key is None
+        or current_device_key is None
+        or pending_net_key is None
+        or pending_app_key is None
+        or pending_device_key is None
+        or not hmac.compare_digest(current_net_key, pending_net_key)
+        or not hmac.compare_digest(current_app_key, pending_app_key)
+        or hmac.compare_digest(current_device_key, pending_device_key)
+    ):
+        return None
+
+    current_unicast = entry.data.get(CONF_UNICAST_ADDRESS, NODE_ADDRESS)
+    pending_unicast = pending.get(CONF_UNICAST_ADDRESS, NODE_ADDRESS)
+    if (
+        not isinstance(current_unicast, int)
+        or isinstance(current_unicast, bool)
+        or not 0x0001 <= current_unicast <= 0x7FFF
+        or pending_unicast != current_unicast
+    ):
+        return None
+    return NetworkKeys.derive(pending_net_key), pending_unicast
+
+
+async def async_reprovision_candidates(
     hass: HomeAssistant,
     entry: ConfigEntry,
     is_fixture: Callable[[BluetoothServiceInfoBleak], bool],
@@ -47,20 +113,7 @@ def async_reprovision_candidates(
     proxy cryptographically, allowing the repair to resume instead of becoming
     stranded behind a provisioning-only candidate filter.
     """
-    try:
-        net_key = bytes.fromhex(entry.data[CONF_NET_KEY])
-        unicast_address = entry.data.get(CONF_UNICAST_ADDRESS, NODE_ADDRESS)
-        if (
-            len(net_key) != 16
-            or not isinstance(unicast_address, int)
-            or isinstance(unicast_address, bool)
-            or not 0x0001 <= unicast_address <= 0x7FFF
-        ):
-            raise ValueError
-        network_keys = NetworkKeys.derive(net_key)
-    except KeyError, TypeError, ValueError:
-        network_keys = None
-        unicast_address = NODE_ADDRESS
+    replacement_identity = await _pending_replacement_identity(hass, entry)
 
     persisted_addresses = {
         value.casefold()
@@ -74,6 +127,9 @@ def async_reprovision_candidates(
     for info in bluetooth.async_discovered_service_info(hass, connectable=True):
         provisioning = _service_data(info, MESH_PROVISIONING_SERVICE)
         proxy = _service_data(info, MESH_PROXY_SERVICE)
+        # Discovery caches are additive, so a genuine reset can retain a stale
+        # Proxy page beside its fresh provisioning page. Keep it eligible here;
+        # the uncached GATT probe before mutation resolves the live bearer.
         if provisioning is not None and (
             is_fixture(info) or info.address.casefold() in persisted_addresses
         ):
@@ -81,8 +137,11 @@ def async_reprovision_candidates(
             continue
         if (
             proxy is not None
-            and network_keys is not None
-            and network_keys.proxy_identity_match(proxy, unicast_address) is not None
+            and replacement_identity is not None
+            and replacement_identity[0].proxy_identity_match(
+                proxy, replacement_identity[1]
+            )
+            is not None
         ):
             candidates[info.address] = info
     return candidates

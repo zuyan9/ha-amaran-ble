@@ -936,7 +936,9 @@ class AmaranConfigFlow(ConfigFlow, domain=DOMAIN):
 
         if user_input is not None and (address := user_input.get(CONF_ADDRESS)):
             if (info := self._discovered.get(address)) is None:
-                return self._reconfigure_form(entry, {"base": "no_devices_found"})
+                return await self._async_reconfigure_form(
+                    entry, {"base": "no_devices_found"}
+                )
             try:
                 provisioned = await async_reprovision_fixture(
                     self.hass,
@@ -950,24 +952,30 @@ class AmaranConfigFlow(ConfigFlow, domain=DOMAIN):
                     info.address,
                     err,
                 )
-                return self._reconfigure_form(entry, {"base": "provisioning_failed"})
+                return await self._async_reconfigure_form(
+                    entry, {"base": "provisioning_failed"}
+                )
             except ProvisioningError as err:
                 _LOGGER.error("re-provisioning %s failed: %s", info.address, err)
-                return self._reconfigure_form(entry, {"base": "provisioning_failed"})
+                return await self._async_reconfigure_form(
+                    entry, {"base": "provisioning_failed"}
+                )
             except (BleakError, TimeoutError) as err:
                 _LOGGER.error("could not reach reset fixture %s: %s", info.address, err)
-                return self._reconfigure_form(entry, {"base": "cannot_connect"})
+                return await self._async_reconfigure_form(
+                    entry, {"base": "cannot_connect"}
+                )
 
             async_update_reprovisioned_entry(self.hass, entry, provisioned)
             return self.async_abort(reason="reconfigure_successful")
 
-        return self._reconfigure_form(entry, {})
+        return await self._async_reconfigure_form(entry, {})
 
-    def _reconfigure_form(
+    async def _async_reconfigure_form(
         self, entry: ConfigEntry, errors: dict[str, str]
     ) -> ConfigFlowResult:
         """Offer current reset candidates and let an empty form rescan."""
-        self._discovered = async_reprovision_candidates(
+        self._discovered = await async_reprovision_candidates(
             self.hass, entry, is_amaran_fixture
         )
         if not self._discovered:

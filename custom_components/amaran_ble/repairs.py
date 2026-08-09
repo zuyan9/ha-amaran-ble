@@ -58,7 +58,7 @@ def async_delete_factory_reset_issue(hass: HomeAssistant, entry_id: str) -> None
     )
 
 
-def _reprovision_candidates(
+async def _async_reprovision_candidates(
     hass: HomeAssistant, entry: ConfigEntry
 ) -> dict[str, BluetoothServiceInfoBleak]:
     """Return reset fixtures and authenticated interrupted-repair proxies."""
@@ -66,7 +66,7 @@ def _reprovision_candidates(
     # callbacks during normal integration setup.
     from .config_flow import is_amaran_fixture
 
-    return async_reprovision_candidates(hass, entry, is_amaran_fixture)
+    return await async_reprovision_candidates(hass, entry, is_amaran_fixture)
 
 
 def _preferred_address(
@@ -121,7 +121,7 @@ class FactoryResetRepairFlow(RepairsFlow):
         if user_input is not None and (address := user_input.get(CONF_ADDRESS)):
             info = self._discovered.get(address)
             if info is None:
-                return self._show_form(entry, {"base": "no_devices_found"})
+                return await self._async_show_form(entry, {"base": "no_devices_found"})
 
             try:
                 # Import lazily so the config flow can finish registering even
@@ -140,26 +140,30 @@ class FactoryResetRepairFlow(RepairsFlow):
                     info.address,
                     err,
                 )
-                return self._show_form(entry, {"base": "provisioning_failed"})
+                return await self._async_show_form(
+                    entry, {"base": "provisioning_failed"}
+                )
             except ProvisioningError as err:
                 _LOGGER.error("re-provisioning %s failed: %s", info.address, err)
-                return self._show_form(entry, {"base": "provisioning_failed"})
+                return await self._async_show_form(
+                    entry, {"base": "provisioning_failed"}
+                )
             except (BleakError, TimeoutError) as err:
                 _LOGGER.error("could not reach reset fixture %s: %s", info.address, err)
-                return self._show_form(entry, {"base": "cannot_connect"})
+                return await self._async_show_form(entry, {"base": "cannot_connect"})
 
             # Replace every mesh credential in one config-entry update while
             # retaining the entry, entity IDs, and device-registry identifier.
             async_update_reprovisioned_entry(self.hass, entry, provisioned)
             return self.async_create_entry(data={})
 
-        return self._show_form(entry, {})
+        return await self._async_show_form(entry, {})
 
-    def _show_form(
+    async def _async_show_form(
         self, entry: ConfigEntry, errors: dict[str, str]
     ) -> RepairsFlowResult:
         """Show a retryable selector without trusting cached bearer state."""
-        self._discovered = _reprovision_candidates(self.hass, entry)
+        self._discovered = await _async_reprovision_candidates(self.hass, entry)
         if not self._discovered:
             return self.async_show_form(
                 step_id="init",

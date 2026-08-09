@@ -457,17 +457,30 @@ async def test_real_reconfigure_flow_preserves_entry_device_and_entities(
 
 
 @pytest.mark.usefixtures("enable_custom_integrations")
+@pytest.mark.parametrize("committed", [False, True])
 async def test_reconfigure_flow_offers_authenticated_post_complete_proxy(
     hass: HomeAssistant,
+    committed: bool,
 ) -> None:
     """A rerun can select the Proxy created before a crash updated the entry."""
     entry = _entry()
     entry.add_to_hass(hass)
     info = _discovery(proxy=True)
+    old_repair_route = "D2:11:22:33:44:55"
+    pending = {
+        "data": _replacement_data(old_repair_route),
+        "committed": committed,
+    }
 
-    with patch(
-        "custom_components.amaran_ble.reconfiguration.bluetooth.async_discovered_service_info",
-        return_value=[info],
+    with (
+        patch(
+            "custom_components.amaran_ble.reconfiguration.bluetooth.async_discovered_service_info",
+            return_value=[info],
+        ),
+        patch(
+            "custom_components.amaran_ble.reconfiguration.async_get_pending",
+            new=AsyncMock(return_value=pending),
+        ) as get_pending,
     ):
         result = await hass.config_entries.flow.async_init(
             DOMAIN,
@@ -478,9 +491,100 @@ async def test_reconfigure_flow_offers_authenticated_post_complete_proxy(
         )
 
     assert result["type"] is data_entry_flow.FlowResultType.FORM
+    assert result["data_schema"]({}) == {CONF_ADDRESS: ALTERNATE_ADDRESS}
     assert result["data_schema"]({CONF_ADDRESS: ALTERNATE_ADDRESS}) == {
         CONF_ADDRESS: ALTERNATE_ADDRESS
     }
+    get_pending.assert_awaited_once_with(hass, ADDRESS)
+    hass.config_entries.flow.async_abort(result["flow_id"])
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+@pytest.mark.parametrize("proxy_address", [ADDRESS, ALTERNATE_ADDRESS])
+@pytest.mark.parametrize(
+    "pending",
+    [
+        pytest.param(None, id="no-record"),
+        pytest.param(
+            {"data": _entry_data(), "committed": True},
+            id="lifetime-same-device-key",
+        ),
+        pytest.param(
+            {
+                "data": {**_replacement_data(), CONF_APP_KEY: "99" * 16},
+                "committed": True,
+            },
+            id="foreign-app-key",
+        ),
+    ],
+)
+async def test_reconfigure_flow_excludes_healthy_authenticated_proxy(
+    hass: HomeAssistant,
+    proxy_address: str,
+    pending: dict[str, object] | None,
+) -> None:
+    """An owned Proxy is not a reset or an interrupted replacement by itself."""
+    entry = _entry(transport_address=ALTERNATE_ADDRESS)
+    entry.add_to_hass(hass)
+    info = _discovery(proxy_address, proxy=True)
+
+    with (
+        patch(
+            "custom_components.amaran_ble.reconfiguration.bluetooth.async_discovered_service_info",
+            return_value=[info],
+        ),
+        patch(
+            "custom_components.amaran_ble.reconfiguration.async_get_pending",
+            new=AsyncMock(return_value=pending),
+        ),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={
+                "source": SOURCE_RECONFIGURE,
+                "entry_id": entry.entry_id,
+            },
+        )
+
+    assert result["type"] is data_entry_flow.FlowResultType.FORM
+    assert result["errors"] == {"base": "no_devices_found"}
+    assert result["data_schema"]({}) == {}
+    with pytest.raises(vol.Invalid):
+        result["data_schema"]({CONF_ADDRESS: proxy_address})
+    hass.config_entries.flow.async_abort(result["flow_id"])
+
+
+@pytest.mark.usefixtures("enable_custom_integrations")
+async def test_reconfigure_flow_offers_reset_but_not_healthy_proxy(
+    hass: HomeAssistant,
+) -> None:
+    """A healthy route cannot become the default beside a real reset candidate."""
+    entry = _entry()
+    entry.add_to_hass(hass)
+    reset = _discovery()
+    healthy = _discovery(ADDRESS, proxy=True)
+
+    with (
+        patch(
+            "custom_components.amaran_ble.reconfiguration.bluetooth.async_discovered_service_info",
+            return_value=[healthy, reset],
+        ),
+        patch(
+            "custom_components.amaran_ble.reconfiguration.async_get_pending",
+            new=AsyncMock(return_value=None),
+        ),
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={
+                "source": SOURCE_RECONFIGURE,
+                "entry_id": entry.entry_id,
+            },
+        )
+
+    assert result["data_schema"]({}) == {CONF_ADDRESS: ALTERNATE_ADDRESS}
+    with pytest.raises(vol.Invalid):
+        result["data_schema"]({CONF_ADDRESS: ADDRESS})
     hass.config_entries.flow.async_abort(result["flow_id"])
 
 
