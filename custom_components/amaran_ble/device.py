@@ -14,6 +14,7 @@ import logging
 import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
+from enum import Enum, auto
 
 from bleak import BleakClient
 from bleak.exc import BleakError
@@ -114,6 +115,29 @@ class PixelRuntimeState:
             # lone continuation report therefore cannot prove on versus off.
             return None
         return self.playback is not pixelfx.PixelPlayback.STOP
+
+
+class _PrimaryConfirmation(Enum):
+    """Outcome of waiting for a fresh primary-state report."""
+
+    MATCHED = auto()
+    NO_REPORT = auto()
+    MISMATCHED = auto()
+    SUPERSEDED = auto()
+
+
+class _LightUpdateSuperseded(Exception):
+    """Stop obsolete confirmation work without cancelling a BLE write."""
+
+
+@dataclass(frozen=True, slots=True)
+class _SteadyLightRequest:
+    """Latest merged set of partial HA brightness/colour patches."""
+
+    intensity: int | None
+    kelvin: int | None
+    hs_color: tuple[float, float] | None
+    superseded: asyncio.Event
 
 
 def _pixel_page_key(state: pixelfx.PixelEffectState) -> tuple[int, int]:
@@ -539,6 +563,58 @@ class AmaranLight:
         self._version2_received = asyncio.Event()
         self._high_speed_received = asyncio.Event()
         self._listeners: list[Callable[[], None]] = []
+        self._primary_report_generation = 0
+        self._last_primary_confirmation = _PrimaryConfirmation.NO_REPORT
+        self._pending_steady_request: _SteadyLightRequest | None = None
+
+    def _register_steady_request(
+        self,
+        *,
+        intensity: int,
+        brightness_changed: bool,
+        kelvin: int | None,
+        hs_color: tuple[float, float] | None,
+    ) -> _SteadyLightRequest:
+        """Merge one partial HA light update into the latest desired look."""
+        previous = self._pending_steady_request
+        previous_intensity = previous.intensity if previous is not None else None
+        previous_kelvin = previous.kelvin if previous is not None else None
+        previous_hs_color = previous.hs_color if previous is not None else None
+        if hs_color is not None:
+            target_kelvin = None
+            target_hs_color = hs_color
+        elif kelvin is not None:
+            target_kelvin = kelvin
+            target_hs_color = None
+        else:
+            target_kelvin = previous_kelvin
+            target_hs_color = previous_hs_color
+        request = _SteadyLightRequest(
+            intensity=intensity if brightness_changed else previous_intensity,
+            kelvin=target_kelvin,
+            hs_color=target_hs_color,
+            superseded=asyncio.Event(),
+        )
+        if previous is not None:
+            previous.superseded.set()
+        self._pending_steady_request = request
+        return request
+
+    def _invalidate_steady_requests(self) -> None:
+        """Make every earlier slider request a successful obsolete no-op."""
+        pending = self._pending_steady_request
+        if pending is not None:
+            pending.superseded.set()
+            self._pending_steady_request = None
+
+    def _current_visible_intensity(self, fallback: int) -> int:
+        """Resolve omitted brightness only after this request owns the lock."""
+        effect = self.effect_state
+        if effect is not None and effect.intensity is not None and effect.intensity > 0:
+            return effect.intensity
+        if self._state is not None and self._state.intensity > 0:
+            return self._state.intensity
+        return fallback
 
     # ─── Public surface ──────────────────────────────────────────────────────
 
@@ -1025,6 +1101,7 @@ class AmaranLight:
                         f"{selected_pixel.value!r} is not a supported effect for "
                         f"{self.name}"
                     ) from None
+                self._invalidate_steady_requests()
                 async with self._operation_lock:
                     await self._async_apply_pixel_effect_unlocked(
                         selected_pixel, intensity=intensity
@@ -1035,6 +1112,7 @@ class AmaranLight:
                     raise AmaranConnectionError(
                         f"{selected2.value!r} is not a supported effect for {self.name}"
                     ) from None
+                self._invalidate_steady_requests()
                 async with self._operation_lock:
                     await self._async_apply_effect2_unlocked(
                         selected2, intensity=intensity
@@ -1047,6 +1125,7 @@ class AmaranLight:
             raise AmaranConnectionError(
                 f"{selected.value!r} is not a supported effect for {self.name}"
             )
+        self._invalidate_steady_requests()
         async with self._operation_lock:
             if selected is telink.SystemEffect.OFF:
                 await self._async_exit_effect(intensity=intensity)
@@ -1155,6 +1234,7 @@ class AmaranLight:
         selected: pixelfx.PixelEffect,
         *,
         intensity: int | None,
+        superseded: asyncio.Event | None = None,
     ) -> None:
         """Select a defaults-proven command-33 pixel program."""
         current = self._pixel_state
@@ -1198,8 +1278,12 @@ class AmaranLight:
         report_generation = self._pixel_report_generation
         for payload in payloads:
             await self._async_send(payload)
+        if superseded is not None and superseded.is_set():
+            raise _LightUpdateSuperseded
         if not output_was_on:
             await self.async_turn_on()
+            if superseded is not None and superseded.is_set():
+                raise _LightUpdateSuperseded
 
         def pixel_effect_matches() -> bool:
             report = self._pixel_state
@@ -1226,7 +1310,13 @@ class AmaranLight:
                 > report_generation
             )
 
-        if not await self._async_confirm_primary_state(pixel_effect_matches):
+        matched = await self._async_confirm_primary_state(
+            pixel_effect_matches,
+            superseded=superseded,
+        )
+        if superseded is not None and superseded.is_set():
+            raise _LightUpdateSuperseded
+        if not matched:
             raise AmaranConnectionError(
                 f"{self.name} did not confirm pixel effect {selected.value}"
             )
@@ -1253,6 +1343,7 @@ class AmaranLight:
         selected: systemfx2.SystemEffect2,
         *,
         intensity: int | None,
+        superseded: asyncio.Event | None = None,
     ) -> None:
         """Select a default-safe command-34 effect with the operation lock held."""
         current = self._effect2_state
@@ -1314,8 +1405,12 @@ class AmaranLight:
             preserving_active_effect = False
         for payload in payloads:
             await self._async_send(payload)
+        if superseded is not None and superseded.is_set():
+            raise _LightUpdateSuperseded
         if not output_was_on:
             await self.async_turn_on()
+            if superseded is not None and superseded.is_set():
+                raise _LightUpdateSuperseded
 
         def effect_matches() -> bool:
             report = self._effect2_state
@@ -1330,7 +1425,13 @@ class AmaranLight:
                 )
             )
 
-        if not await self._async_confirm_primary_state(effect_matches):
+        matched = await self._async_confirm_primary_state(
+            effect_matches,
+            superseded=superseded,
+        )
+        if superseded is not None and superseded.is_set():
+            raise _LightUpdateSuperseded
+        if not matched:
             raise AmaranConnectionError(
                 f"{self.name} did not confirm effect {selected.value}"
             )
@@ -1836,131 +1937,212 @@ class AmaranLight:
         kelvin: int | None = None,
         hs_color: tuple[float, float] | None = None,
     ) -> None:
-        """Apply light parameters, power, and state refresh as one operation."""
-        async with self._operation_lock:
-            state = self._state
-            effect_state = self.effect_state
-            expected_gm = self._preferred_gm
-            boost_active = self._boost_state is not None and self._boost_state.enabled
-            if boost_active and (
+        """Apply one discrete action or the latest merged slider request."""
+        parameterized = brightness_changed or kelvin is not None or hs_color is not None
+        if not parameterized:
+            self._invalidate_steady_requests()
+            async with self._operation_lock:
+                await self._async_apply_turn_on_unlocked(
+                    intensity=intensity,
+                    brightness_changed=False,
+                )
+            return
+
+        request = self._register_steady_request(
+            intensity=intensity,
+            brightness_changed=brightness_changed,
+            kelvin=kelvin,
+            hs_color=hs_color,
+        )
+        try:
+            async with self._operation_lock:
+                if request.superseded.is_set():
+                    return
+                target_intensity = (
+                    request.intensity
+                    if request.intensity is not None
+                    else self._current_visible_intensity(intensity)
+                )
+                await self._async_apply_turn_on_unlocked(
+                    intensity=target_intensity,
+                    brightness_changed=request.intensity is not None,
+                    kelvin=request.kelvin,
+                    hs_color=request.hs_color,
+                    request=request,
+                )
+        except _LightUpdateSuperseded:
+            return
+        except asyncio.CancelledError:
+            # A service call can be cancelled before it acquires the operation
+            # lock. Do not leave its unsent partial intent available for a
+            # future request to merge.
+            request.superseded.set()
+            raise
+        finally:
+            if self._pending_steady_request is request:
+                self._pending_steady_request = None
+
+    async def _async_apply_turn_on_unlocked(
+        self,
+        *,
+        intensity: int,
+        brightness_changed: bool,
+        kelvin: int | None = None,
+        hs_color: tuple[float, float] | None = None,
+        request: _SteadyLightRequest | None = None,
+    ) -> None:
+        """Apply one atomic light transaction while owning _operation_lock."""
+        superseded = request.superseded if request is not None else None
+
+        def ensure_current() -> None:
+            if superseded is not None and superseded.is_set():
+                raise _LightUpdateSuperseded
+
+        async def confirm(predicate: Callable[[], bool]) -> _PrimaryConfirmation:
+            matched = await self._async_confirm_primary_state(
+                predicate,
+                superseded=superseded,
+            )
+            if superseded is not None and superseded.is_set():
+                raise _LightUpdateSuperseded
+            return (
+                _PrimaryConfirmation.MATCHED
+                if matched
+                else self._last_primary_confirmation
+            )
+
+        state = self._state
+        effect_state = self.effect_state
+        expected_gm = self._preferred_gm
+        boost_active = self._boost_state is not None and self._boost_state.enabled
+        if boost_active and (
+            brightness_changed or hs_color is not None or kelvin is not None
+        ):
+            await self._async_set_boost_unlocked(False)
+            ensure_current()
+        if self._effect2_state is not None and hs_color is None and kelvin is None:
+            await self._async_apply_effect2_unlocked(
+                self._effect2_state.effect,
+                intensity=intensity if brightness_changed else None,
+                superseded=superseded,
+            )
+            return
+        if self._pixel_state is not None and hs_color is None and kelvin is None:
+            if not brightness_changed and self._pixel_state.on is True:
+                # A control-only report after reconnect does not contain the
+                # colour program. Rebuilding an already-on effect would replace
+                # that program with defaults, so read back an idempotent ON.
+                selected = self._pixel_state.effect
+                result = await confirm(
+                    lambda: (
+                        self._pixel_state is not None
+                        and self._pixel_state.effect is selected
+                        and self._pixel_state.on is True
+                    )
+                )
+                if result is not _PrimaryConfirmation.MATCHED:
+                    raise AmaranConnectionError(
+                        f"{self.name} did not confirm its pixel effect state"
+                    )
+                return
+            if brightness_changed and not _pixel_pages_complete(self._pixel_state):
+                raise AmaranConnectionError(
+                    f"{self.name} has not reported its complete pixel program; "
+                    "reselect the effect before changing brightness"
+                )
+            await self._async_apply_pixel_effect_unlocked(
+                self._pixel_state.effect,
+                intensity=intensity if brightness_changed else None,
+                superseded=superseded,
+            )
+            return
+        if effect_state is not None and hs_color is None and kelvin is None:
+            expected_intensity = (
+                intensity if brightness_changed else effect_state.intensity
+            )
+            expected_effect = effect_state
+            if brightness_changed:
+                payload = self._effect_payload(
+                    effect_state, intensity=expected_intensity
+                )
+                expected_effect = telink.decode_effect(payload)
+                assert expected_effect is not None
+                await self._async_send(payload)
+                ensure_current()
+            if not effect_state.on:
+                await self.async_turn_on()
+                expected_effect = replace(expected_effect, on=True)
+                ensure_current()
+            result = await confirm(
+                lambda: _effect_state_matches(self._effect_state, expected_effect)
+            )
+            if result is not _PrimaryConfirmation.MATCHED:
+                raise AmaranConnectionError(
+                    f"{self.name} did not confirm its effect state"
+                )
+            return
+
+        if hs_color is not None:
+            await self.async_set_hsi(hs_color[0], hs_color[1], intensity)
+            ensure_current()
+        elif kelvin is not None:
+            await self.async_set_cct(kelvin, intensity, expected_gm)
+            ensure_current()
+        elif brightness_changed:
+            await self.async_set_brightness(intensity)
+            ensure_current()
+
+        # Parameter messages do not wake a sleeping fixture. Power on last so
+        # it never flashes at the previous settings.
+        if effect_state is not None or state is None or not state.on:
+            await self.async_turn_on()
+            ensure_current()
+
+        def steady_state_matches() -> bool:
+            current = self._state
+            if (
+                self._effect_state is not None
+                or self._effect2_state is not None
+                or self._pixel_state is not None
+                or current is None
+                or not current.on
+            ):
+                return False
+            if not intensities_have_same_brightness(current.intensity, intensity) and (
                 brightness_changed or hs_color is not None or kelvin is not None
             ):
-                await self._async_set_boost_unlocked(False)
-                boost_active = False
-            if self._effect2_state is not None and hs_color is None and kelvin is None:
-                await self._async_apply_effect2_unlocked(
-                    self._effect2_state.effect,
-                    intensity=intensity if brightness_changed else None,
-                )
-                return
-            if self._pixel_state is not None and hs_color is None and kelvin is None:
-                if not brightness_changed and self._pixel_state.on is True:
-                    # A control-only report after reconnect does not contain
-                    # the colour program. Rebuilding an already-on effect
-                    # would replace that program with defaults, so an
-                    # idempotent HA turn_on performs only a read-back.
-                    selected = self._pixel_state.effect
-                    if not await self._async_confirm_primary_state(
-                        lambda: (
-                            self._pixel_state is not None
-                            and self._pixel_state.effect is selected
-                            and self._pixel_state.on is True
-                        )
-                    ):
-                        raise AmaranConnectionError(
-                            f"{self.name} did not confirm its pixel effect state"
-                        )
-                    return
-                if brightness_changed and not _pixel_pages_complete(self._pixel_state):
-                    # A status report may contain only the control page. There
-                    # is no command-33 brightness-only packet, so rebuilding
-                    # here would silently replace unknown custom colours with
-                    # defaults. Make the limitation explicit; selecting the
-                    # effect again remains the intentional reset path.
-                    raise AmaranConnectionError(
-                        f"{self.name} has not reported its complete pixel program; "
-                        "reselect the effect before changing brightness"
-                    )
-                await self._async_apply_pixel_effect_unlocked(
-                    self._pixel_state.effect,
-                    intensity=intensity if brightness_changed else None,
-                )
-                return
-            if effect_state is not None and hs_color is None and kelvin is None:
-                expected_intensity = (
-                    intensity if brightness_changed else effect_state.intensity
-                )
-                expected_effect = effect_state
-                if brightness_changed:
-                    payload = self._effect_payload(
-                        effect_state, intensity=expected_intensity
-                    )
-                    expected_effect = telink.decode_effect(payload)
-                    assert expected_effect is not None
-                    await self._async_send(payload)
-                if not effect_state.on:
-                    await self.async_turn_on()
-                    expected_effect = replace(expected_effect, on=True)
-                if not await self._async_confirm_primary_state(
-                    lambda: _effect_state_matches(self._effect_state, expected_effect)
-                ):
-                    raise AmaranConnectionError(
-                        f"{self.name} did not confirm its effect state"
-                    )
-                return
-
+                return False
             if hs_color is not None:
-                await self.async_set_hsi(hs_color[0], hs_color[1], intensity)
-            elif kelvin is not None:
-                await self.async_set_cct(kelvin, intensity, expected_gm)
-            elif brightness_changed:
-                await self.async_set_brightness(intensity)
-
-            # Parameter messages do not wake a sleeping fixture. Power on
-            # last so it never flashes at the previous settings.
-            if effect_state is not None or state is None or not state.on:
-                await self.async_turn_on()
-
-            def steady_state_matches() -> bool:
-                current = self._state
-                if (
-                    self._effect_state is not None
-                    or self._effect2_state is not None
-                    or self._pixel_state is not None
-                    or current is None
-                    or not current.on
-                ):
-                    return False
-                if not intensities_have_same_brightness(
-                    current.intensity, intensity
-                ) and (
-                    brightness_changed or hs_color is not None or kelvin is not None
-                ):
-                    return False
-                if hs_color is not None:
-                    return (
-                        current.is_hsi
-                        and current.hue == math.floor(hs_color[0] + 0.5)
-                        and current.saturation == math.floor(hs_color[1] + 0.5)
-                    )
-                if kelvin is not None:
-                    # The app truncates positive Kelvin to the command-2 wire's
-                    # ten-Kelvin resolution before sending it.
-                    expected_kelvin = int(kelvin // 10) * 10
-                    return (
-                        not current.is_hsi
-                        and current.kelvin == expected_kelvin
-                        and current.gm == expected_gm
-                    )
-                return True
-
-            if not await self._async_confirm_primary_state(steady_state_matches):
-                raise AmaranConnectionError(
-                    f"{self.name} did not confirm its requested light state"
+                return (
+                    current.is_hsi
+                    and current.hue == math.floor(hs_color[0] + 0.5)
+                    and current.saturation == math.floor(hs_color[1] + 0.5)
                 )
+            if kelvin is not None:
+                # The app truncates positive Kelvin to the command-2 wire's
+                # ten-Kelvin resolution before sending it.
+                expected_kelvin = int(kelvin // 10) * 10
+                return (
+                    not current.is_hsi
+                    and current.kelvin == expected_kelvin
+                    and current.gm == expected_gm
+                )
+            return True
+
+        result = await confirm(steady_state_matches)
+        if result is _PrimaryConfirmation.MATCHED:
+            return
+        if result is _PrimaryConfirmation.NO_REPORT:
+            raise AmaranConnectionError(
+                f"{self.name} did not return a report for its requested light state"
+            )
+        raise AmaranConnectionError(
+            f"{self.name} reported a different state than its requested light state"
+        )
 
     async def async_apply_turn_off(self) -> None:
         """Power down and refresh without interleaving another entity command."""
+        self._invalidate_steady_requests()
         async with self._operation_lock:
             boost_error: AmaranConnectionError | None = None
             pixel_error: AmaranConnectionError | None = None
@@ -2090,18 +2272,83 @@ class AmaranLight:
         *,
         attempts: int = 3,
         timeout: float = 0.7,
+        superseded: asyncio.Event | None = None,
     ) -> bool:
         """Query until a fresh primary report matches an expected result."""
+        result = await self._async_confirm_primary_state_result(
+            predicate,
+            attempts=attempts,
+            timeout=timeout,
+            superseded=superseded,
+        )
+        self._last_primary_confirmation = result
+        return result is _PrimaryConfirmation.MATCHED
+
+    async def _async_confirm_primary_state_result(
+        self,
+        predicate: Callable[[], bool],
+        *,
+        attempts: int = 3,
+        timeout: float = 0.7,
+        superseded: asyncio.Event | None = None,
+    ) -> _PrimaryConfirmation:
+        """Classify fresh matching, mismatching, missing, or obsolete reads."""
+        observed_generation = self._primary_report_generation
+        reports_received = False
         for _ in range(attempts):
+            if superseded is not None and superseded.is_set():
+                return _PrimaryConfirmation.SUPERSEDED
+            if self._primary_report_generation > observed_generation:
+                observed_generation = self._primary_report_generation
+                reports_received = True
+                if predicate():
+                    return _PrimaryConfirmation.MATCHED
             self._state_received.clear()
             await self._async_send(telink.status_request(), retries=1)
-            with contextlib.suppress(TimeoutError):
-                async with asyncio.timeout(timeout):
-                    await self._state_received.wait()
+            if superseded is None:
+                with contextlib.suppress(TimeoutError):
+                    async with asyncio.timeout(timeout):
+                        await self._state_received.wait()
+            else:
+                report_waiter = asyncio.create_task(self._state_received.wait())
+                superseded_waiter = asyncio.create_task(superseded.wait())
+                try:
+                    await asyncio.wait(
+                        (report_waiter, superseded_waiter),
+                        timeout=timeout,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    for waiter in (report_waiter, superseded_waiter):
+                        if not waiter.done():
+                            waiter.cancel()
+                    await asyncio.gather(
+                        report_waiter,
+                        superseded_waiter,
+                        return_exceptions=True,
+                    )
+                if superseded.is_set():
+                    return _PrimaryConfirmation.SUPERSEDED
+            if self._primary_report_generation > observed_generation:
+                observed_generation = self._primary_report_generation
+                reports_received = True
                 if predicate():
-                    return True
-        _LOGGER.debug("%s did not report its state", self.address)
-        return False
+                    return _PrimaryConfirmation.MATCHED
+        result = (
+            _PrimaryConfirmation.MISMATCHED
+            if reports_received
+            else _PrimaryConfirmation.NO_REPORT
+        )
+        _LOGGER.debug(
+            "%s %s",
+            self.address,
+            (
+                "reported a primary state that did not match the request"
+                if reports_received
+                else "did not return a primary-state report"
+            ),
+        )
+        return result
 
     async def _async_wait_for(
         self, event: asyncio.Event, timeout: float = OPTIONAL_REPORT_TIMEOUT
@@ -2642,7 +2889,6 @@ class AmaranLight:
             self._pixel_state = None
             self._pixel_page_generations.clear()
             self._missed_polls = 0
-            self._state_received.set()
             primary_report = True
         elif isinstance(report, telink.EffectState):
             if report.effect.value not in self.profile.effects:
@@ -2668,7 +2914,6 @@ class AmaranLight:
             self._pixel_state = None
             self._pixel_page_generations.clear()
             self._missed_polls = 0
-            self._state_received.set()
             primary_report = True
         elif isinstance(report, systemfx2.SystemEffect2State):
             if report.effect.value not in self.profile.system_effects2:
@@ -2694,7 +2939,6 @@ class AmaranLight:
             self._pixel_state = None
             self._pixel_page_generations.clear()
             self._missed_polls = 0
-            self._state_received.set()
             primary_report = True
         elif isinstance(report, pixelfx.PixelEffectState):
             if report.effect.value not in self.profile.pixel_effects:
@@ -2718,7 +2962,6 @@ class AmaranLight:
             self._effect_state = None
             self._effect2_state = None
             self._missed_polls = 0
-            self._state_received.set()
             primary_report = True
         elif isinstance(report, telink.BoostState):
             if not self.profile.supports_boost:
@@ -2767,6 +3010,8 @@ class AmaranLight:
         # Optional report pages are deliberately insufficient: require one of
         # the primary state families that makes the light entity available.
         if primary_report:
+            self._primary_report_generation += 1
+            self._state_received.set()
             self._notify_provisioned()
 
         # Always release the matching waiter; an unchanged report still proves

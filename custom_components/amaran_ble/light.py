@@ -44,9 +44,11 @@ from .profiles import EFFECT_OFF
 
 _LOGGER = logging.getLogger(__name__)
 
-# A turn-on can be a three-message transaction (parameters, power, refresh).
-# Keep entity service calls from interleaving those messages.
-PARALLEL_UPDATES = 1
+# Let rapid slider calls reach the device-level latest-wins arbiter while the
+# previous value is still awaiting confirmation. AmaranLight._operation_lock
+# remains the sole owner of packet serialization, so BLE transactions cannot
+# interleave even though Home Assistant may enter entity actions concurrently.
+PARALLEL_UPDATES = 0
 
 
 async def async_setup_entry(

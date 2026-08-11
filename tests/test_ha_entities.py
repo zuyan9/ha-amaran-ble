@@ -45,6 +45,11 @@ from custom_components.amaran_ble.profiles import (
 )
 
 
+def test_light_platform_allows_device_level_latest_wins() -> None:
+    """HA must not queue slider calls before the device can coalesce them."""
+    assert light.PARALLEL_UPDATES == 0
+
+
 def make_entry(
     options: dict,
     *,
