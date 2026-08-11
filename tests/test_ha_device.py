@@ -106,6 +106,27 @@ def light_state(
     )
 
 
+async def wait_for_pending_steady_request(
+    light: device.AmaranLight,
+    expected: tuple[int | None, int | None, tuple[float, float] | None],
+) -> None:
+    """Yield until concurrent calls have registered their desired state."""
+    for _ in range(20):
+        request = light._pending_steady_request
+        if (
+            request is not None
+            and (
+                request.intensity,
+                request.kelvin,
+                request.hs_color,
+            )
+            == expected
+        ):
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(f"pending steady request {expected!r} was not reached")
+
+
 @pytest.mark.asyncio
 async def test_sequence_store_merge_uses_highest_safe_value() -> None:
     """Recovery and rollback stores can never pull the sequence backwards."""
@@ -1718,6 +1739,640 @@ async def test_brightness_only_write_accepts_same_ha_brightness_report(
         telink.status_request(),
     ]
     assert light.state is not None and light.state.intensity == 501
+
+
+@pytest.mark.asyncio
+async def test_rapid_brightness_updates_skip_intermediate_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the newest slider value is sent after the in-flight transaction."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._state = light_state(is_hsi=False, on=True, intensity=100)
+    first_write_started = asyncio.Event()
+    release_first_write = asyncio.Event()
+    payloads: list[bytes] = []
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        del retries
+        payloads.append(payload)
+        if payload == telink.brightness(200):
+            first_write_started.set()
+            await release_first_write.wait()
+        elif payload == telink.status_request():
+            light._on_access_message(
+                access_message(as_report(telink.cct(4300, 400), on=True))
+            )
+
+    light._async_send = AsyncMock(side_effect=send)
+    first = asyncio.create_task(
+        light.async_apply_turn_on(intensity=200, brightness_changed=True)
+    )
+    await first_write_started.wait()
+    middle = asyncio.create_task(
+        light.async_apply_turn_on(intensity=300, brightness_changed=True)
+    )
+    latest = asyncio.create_task(
+        light.async_apply_turn_on(intensity=400, brightness_changed=True)
+    )
+    await wait_for_pending_steady_request(light, (400, None, None))
+    release_first_write.set()
+
+    await asyncio.wait_for(asyncio.gather(first, middle, latest), 1)
+
+    assert payloads == [
+        telink.brightness(200),
+        telink.brightness(400),
+        telink.status_request(),
+    ]
+    assert light.state is not None and light.state.intensity == 400
+    assert light._pending_steady_request is None
+
+
+@pytest.mark.asyncio
+async def test_new_slider_value_wakes_obsolete_confirmation_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A newer value supersedes the exact unanswered read seen in live HA."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._state = light_state(is_hsi=False, on=True, intensity=100)
+    first_status_sent = asyncio.Event()
+    payloads: list[bytes] = []
+    status_requests = 0
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        nonlocal status_requests
+        del retries
+        payloads.append(payload)
+        if payload != telink.status_request():
+            return
+        status_requests += 1
+        if status_requests == 1:
+            first_status_sent.set()
+            return
+        light._on_access_message(
+            access_message(as_report(telink.cct(4300, 400), on=True))
+        )
+
+    light._async_send = AsyncMock(side_effect=send)
+    obsolete = asyncio.create_task(
+        light.async_apply_turn_on(intensity=200, brightness_changed=True)
+    )
+    await first_status_sent.wait()
+    # Let the first operation reach its 0.7-second report wait before a newer
+    # frontend slider value arrives.
+    await asyncio.sleep(0)
+    assert light._operation_lock.locked()
+    assert not obsolete.done()
+
+    latest = asyncio.create_task(
+        light.async_apply_turn_on(intensity=400, brightness_changed=True)
+    )
+    await wait_for_pending_steady_request(light, (400, None, None))
+
+    await asyncio.wait_for(obsolete, 1)
+    await asyncio.wait_for(latest, 1)
+
+    assert payloads == [
+        telink.brightness(200),
+        telink.status_request(),
+        telink.brightness(400),
+        telink.status_request(),
+    ]
+    assert status_requests == 2
+    assert light.state is not None and light.state.intensity == 400
+
+
+@pytest.mark.asyncio
+async def test_cancelled_queued_slider_request_does_not_leak_partial_intent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation before the device lock cannot contaminate a later call."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._state = light_state(is_hsi=False, on=True, intensity=100)
+    first_write_started = asyncio.Event()
+    release_first_write = asyncio.Event()
+    payloads: list[bytes] = []
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        del retries
+        payloads.append(payload)
+        if payload == telink.brightness(200):
+            first_write_started.set()
+            await release_first_write.wait()
+        elif payload == telink.status_request():
+            light._on_access_message(
+                access_message(as_report(telink.cct(4500, 100), on=True))
+            )
+
+    light._async_send = AsyncMock(side_effect=send)
+    first = asyncio.create_task(
+        light.async_apply_turn_on(intensity=200, brightness_changed=True)
+    )
+    await first_write_started.wait()
+    cancelled = asyncio.create_task(
+        light.async_apply_turn_on(intensity=300, brightness_changed=True)
+    )
+    await wait_for_pending_steady_request(light, (300, None, None))
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+    assert light._pending_steady_request is None
+
+    release_first_write.set()
+    await asyncio.wait_for(first, 1)
+    latest = asyncio.create_task(
+        light.async_apply_turn_on(
+            intensity=999,
+            brightness_changed=False,
+            kelvin=4500,
+        )
+    )
+    await asyncio.wait_for(latest, 1)
+
+    assert payloads == [
+        telink.brightness(200),
+        telink.cct(4500, 100),
+        telink.status_request(),
+    ]
+    assert telink.brightness(300) not in payloads
+    assert light._pending_steady_request is None
+
+
+@pytest.mark.asyncio
+async def test_rapid_effect_brightness_updates_only_confirm_latest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Latest-wins also covers brightness while a legacy effect is active."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._effect_state = telink.EffectState(
+        on=True,
+        effect=telink.SystemEffect.PULSING,
+        intensity=100,
+        frequency=4,
+        speed=7,
+        trigger=2,
+        kelvin=4300,
+    )
+    first_payload = light._effect_payload(light._effect_state, intensity=200)
+    middle_payload = light._effect_payload(light._effect_state, intensity=300)
+    final_payload = light._effect_payload(light._effect_state, intensity=400)
+    first_write_started = asyncio.Event()
+    release_first_write = asyncio.Event()
+    payloads: list[bytes] = []
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        del retries
+        payloads.append(payload)
+        if payload == first_payload:
+            first_write_started.set()
+            await release_first_write.wait()
+        elif payload == telink.status_request():
+            light._on_access_message(access_message(as_report(final_payload)))
+
+    light._async_send = AsyncMock(side_effect=send)
+    first = asyncio.create_task(
+        light.async_apply_turn_on(intensity=200, brightness_changed=True)
+    )
+    await first_write_started.wait()
+    middle = asyncio.create_task(
+        light.async_apply_turn_on(intensity=300, brightness_changed=True)
+    )
+    latest = asyncio.create_task(
+        light.async_apply_turn_on(intensity=400, brightness_changed=True)
+    )
+    await wait_for_pending_steady_request(light, (400, None, None))
+    release_first_write.set()
+
+    await asyncio.wait_for(asyncio.gather(first, middle, latest), 1)
+
+    assert payloads == [first_payload, final_payload, telink.status_request()]
+    assert middle_payload not in payloads
+    assert light.effect_state is not None
+    assert light.effect_state.intensity == 400
+
+
+@pytest.mark.asyncio
+async def test_rapid_effect2_brightness_completes_packets_then_sends_latest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An obsolete multi-packet effect2 write finishes before latest wins."""
+    profile = get_fixture_profile_by_product_id("000G5")
+    light = make_light(monkeypatch, profile=profile)
+    for payload in systemfx2.effect2(
+        systemfx2.SystemEffect2.LIGHTNING_II,
+        intensity=100,
+        frequency=5,
+        speed=7,
+        mode=1,
+        hue=120,
+        saturation=75,
+        center_kelvin=5600,
+    ):
+        light._on_access_message(access_message(as_report(payload)))
+    assert light.effect2_state is not None
+    first_payloads = light._effect2_payloads(light.effect2_state, intensity=200)
+    latest_payloads = light._effect2_payloads(light.effect2_state, intensity=400)
+    first_write_started = asyncio.Event()
+    release_first_write = asyncio.Event()
+    payloads: list[bytes] = []
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        del retries
+        payloads.append(payload)
+        if payload == first_payloads[0]:
+            first_write_started.set()
+            await release_first_write.wait()
+        elif payload == telink.status_request():
+            for report in latest_payloads:
+                light._on_access_message(access_message(as_report(report)))
+
+    light._async_send = AsyncMock(side_effect=send)
+    obsolete = asyncio.create_task(
+        light.async_apply_turn_on(intensity=200, brightness_changed=True)
+    )
+    await first_write_started.wait()
+    latest = asyncio.create_task(
+        light.async_apply_turn_on(intensity=400, brightness_changed=True)
+    )
+    await wait_for_pending_steady_request(light, (400, None, None))
+    release_first_write.set()
+
+    await asyncio.wait_for(asyncio.gather(obsolete, latest), 1)
+
+    assert payloads == [
+        *first_payloads,
+        *latest_payloads,
+        telink.status_request(),
+    ]
+    assert light.effect2_state is not None
+    assert light.effect2_state.intensity == 400
+
+
+@pytest.mark.asyncio
+async def test_rapid_pixel_brightness_completes_packets_then_sends_latest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pixel program is never abandoned half-written when superseded."""
+    profile = get_fixture_profile_by_product_id("000F5")
+    light = make_light(monkeypatch, profile=profile)
+    for payload in pixelfx.effect(pixelfx.PixelEffect.COLOR_FADE):
+        light._on_access_message(access_message(as_report(payload)))
+    assert light.pixel_state is not None
+    first_payloads = device._pixel_payloads(
+        light.pixel_state,
+        intensity=200,
+        on=True,
+    )
+    latest_payloads = device._pixel_payloads(
+        light.pixel_state,
+        intensity=400,
+        on=True,
+    )
+    first_write_started = asyncio.Event()
+    release_first_write = asyncio.Event()
+    payloads: list[bytes] = []
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        del retries
+        payloads.append(payload)
+        if payload == first_payloads[0]:
+            first_write_started.set()
+            await release_first_write.wait()
+        elif payload == telink.status_request():
+            for report in latest_payloads:
+                light._on_access_message(access_message(as_report(report)))
+
+    light._async_send = AsyncMock(side_effect=send)
+    obsolete = asyncio.create_task(
+        light.async_apply_turn_on(intensity=200, brightness_changed=True)
+    )
+    await first_write_started.wait()
+    latest = asyncio.create_task(
+        light.async_apply_turn_on(intensity=400, brightness_changed=True)
+    )
+    await wait_for_pending_steady_request(light, (400, None, None))
+    release_first_write.set()
+
+    await asyncio.wait_for(asyncio.gather(obsolete, latest), 1)
+
+    assert payloads == [
+        *first_payloads,
+        *latest_payloads,
+        telink.status_request(),
+    ]
+    assert light.pixel_state is not None
+    assert light.pixel_state.intensity == 400
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_kind", ["brightness", "cct"])
+async def test_mixed_slider_updates_merge_partial_brightness_and_cct(
+    monkeypatch: pytest.MonkeyPatch,
+    first_kind: str,
+) -> None:
+    """A later partial patch cannot resurrect cached brightness or colour."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._state = light_state(is_hsi=False, on=True, intensity=100)
+    first_write_started = asyncio.Event()
+    release_first_write = asyncio.Event()
+    payloads: list[bytes] = []
+    first_payload = (
+        telink.brightness(200) if first_kind == "brightness" else telink.cct(4509, 100)
+    )
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        del retries
+        payloads.append(payload)
+        if payload == first_payload:
+            first_write_started.set()
+            await release_first_write.wait()
+        elif payload == telink.status_request():
+            light._on_access_message(
+                access_message(as_report(telink.cct(4509, 200), on=True))
+            )
+
+    light._async_send = AsyncMock(side_effect=send)
+    if first_kind == "brightness":
+        first = asyncio.create_task(
+            light.async_apply_turn_on(intensity=200, brightness_changed=True)
+        )
+    else:
+        first = asyncio.create_task(
+            light.async_apply_turn_on(
+                intensity=100,
+                brightness_changed=False,
+                kelvin=4509,
+            )
+        )
+    await first_write_started.wait()
+    if first_kind == "brightness":
+        latest = asyncio.create_task(
+            light.async_apply_turn_on(
+                intensity=100,
+                brightness_changed=False,
+                kelvin=4509,
+            )
+        )
+    else:
+        latest = asyncio.create_task(
+            light.async_apply_turn_on(intensity=200, brightness_changed=True)
+        )
+    await wait_for_pending_steady_request(light, (200, 4509, None))
+    release_first_write.set()
+
+    await asyncio.wait_for(asyncio.gather(first, latest), 1)
+
+    assert payloads == [
+        first_payload,
+        telink.cct(4509, 200),
+        telink.status_request(),
+    ]
+    assert light.state is not None
+    assert light.state.intensity == 200
+    assert light.state.kelvin == 4500
+
+
+@pytest.mark.asyncio
+async def test_latest_colour_mode_replaces_superseded_cct(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HS supersedes an unconfirmed CCT patch without losing brightness."""
+    light = make_light(monkeypatch)
+    light._state = light_state(is_hsi=False, on=True, intensity=100)
+    first_write_started = asyncio.Event()
+    release_first_write = asyncio.Event()
+    payloads: list[bytes] = []
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        del retries
+        payloads.append(payload)
+        if payload == telink.cct(4500, 200):
+            first_write_started.set()
+            await release_first_write.wait()
+        elif payload == telink.status_request():
+            light._on_access_message(
+                access_message(as_report(telink.hsi(180, 50, 200), on=True))
+            )
+
+    light._async_send = AsyncMock(side_effect=send)
+    first = asyncio.create_task(
+        light.async_apply_turn_on(
+            intensity=200,
+            brightness_changed=True,
+            kelvin=4500,
+        )
+    )
+    await first_write_started.wait()
+    latest = asyncio.create_task(
+        light.async_apply_turn_on(
+            intensity=100,
+            brightness_changed=False,
+            hs_color=(180, 50),
+        )
+    )
+    await wait_for_pending_steady_request(light, (200, None, (180, 50)))
+    release_first_write.set()
+
+    await asyncio.wait_for(asyncio.gather(first, latest), 1)
+
+    assert payloads == [
+        telink.cct(4500, 200),
+        telink.hsi(180, 50, 200),
+        telink.status_request(),
+    ]
+    assert light.state is not None
+    assert light.state.is_hsi
+    assert light.state.intensity == 200
+
+
+@pytest.mark.asyncio
+async def test_only_latest_slider_failure_is_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An obsolete request succeeds while the unsatisfied final value fails."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._state = light_state(is_hsi=False, on=True, intensity=100)
+    first_write_started = asyncio.Event()
+    release_first_write = asyncio.Event()
+    status_requests = 0
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        nonlocal status_requests
+        del retries
+        if payload == telink.brightness(200):
+            first_write_started.set()
+            await release_first_write.wait()
+        elif payload == telink.status_request():
+            status_requests += 1
+            light._on_access_message(
+                access_message(as_report(telink.cct(4300, 100), on=True))
+            )
+
+    light._async_send = AsyncMock(side_effect=send)
+    obsolete = asyncio.create_task(
+        light.async_apply_turn_on(intensity=200, brightness_changed=True)
+    )
+    await first_write_started.wait()
+    latest = asyncio.create_task(
+        light.async_apply_turn_on(intensity=400, brightness_changed=True)
+    )
+    await wait_for_pending_steady_request(light, (400, None, None))
+    release_first_write.set()
+
+    await asyncio.wait_for(obsolete, 1)
+    with pytest.raises(device.AmaranConnectionError, match="reported a different"):
+        await asyncio.wait_for(latest, 1)
+
+    assert status_requests == 3
+
+
+@pytest.mark.asyncio
+async def test_off_invalidates_queued_slider_updates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No obsolete slider packet can run after a later explicit OFF."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._state = light_state(is_hsi=False, on=True, intensity=100)
+    first_write_started = asyncio.Event()
+    release_first_write = asyncio.Event()
+    payloads: list[bytes] = []
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        del retries
+        payloads.append(payload)
+        if payload == telink.brightness(200):
+            first_write_started.set()
+            await release_first_write.wait()
+        elif payload == telink.status_request():
+            light._on_access_message(
+                access_message(as_report(telink.cct(4300, 100), on=False))
+            )
+
+    light._async_send = AsyncMock(side_effect=send)
+    first = asyncio.create_task(
+        light.async_apply_turn_on(intensity=200, brightness_changed=True)
+    )
+    await first_write_started.wait()
+    queued = asyncio.create_task(
+        light.async_apply_turn_on(intensity=300, brightness_changed=True)
+    )
+    await wait_for_pending_steady_request(light, (300, None, None))
+    turn_off = asyncio.create_task(light.async_apply_turn_off())
+    await asyncio.sleep(0)
+    release_first_write.set()
+
+    await asyncio.wait_for(asyncio.gather(first, queued, turn_off), 1)
+
+    assert telink.brightness(300) not in payloads
+    assert payloads == [
+        telink.brightness(200),
+        telink.onoff(False),
+        telink.status_request(),
+    ]
+    assert light.state is not None and not light.state.on
+
+
+@pytest.mark.asyncio
+async def test_supersession_never_hides_a_transport_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only obsolete confirmation errors are suppressed, never failed writes."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._state = light_state(is_hsi=False, on=True, intensity=100)
+    first_write_started = asyncio.Event()
+    release_first_write = asyncio.Event()
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        del retries
+        if payload == telink.brightness(200):
+            first_write_started.set()
+            await release_first_write.wait()
+            raise device.AmaranConnectionError("transport write failed")
+        if payload == telink.status_request():
+            light._on_access_message(
+                access_message(as_report(telink.cct(4300, 400), on=True))
+            )
+
+    light._async_send = AsyncMock(side_effect=send)
+    failed = asyncio.create_task(
+        light.async_apply_turn_on(intensity=200, brightness_changed=True)
+    )
+    await first_write_started.wait()
+    latest = asyncio.create_task(
+        light.async_apply_turn_on(intensity=400, brightness_changed=True)
+    )
+    await wait_for_pending_steady_request(light, (400, None, None))
+    release_first_write.set()
+
+    with pytest.raises(device.AmaranConnectionError, match="transport write failed"):
+        await asyncio.wait_for(failed, 1)
+    await asyncio.wait_for(latest, 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "message"),
+    [
+        (device._PrimaryConfirmation.NO_REPORT, "did not return a report"),
+        (device._PrimaryConfirmation.MISMATCHED, "reported a different state"),
+    ],
+)
+async def test_final_light_confirmation_explains_failure_class(
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: device._PrimaryConfirmation,
+    message: str,
+) -> None:
+    """Latest failures distinguish missing reports from mismatching reports."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._state = light_state(is_hsi=False, on=True, intensity=100)
+    light._last_primary_confirmation = outcome
+    light._async_send = AsyncMock()
+    light._async_confirm_primary_state = AsyncMock(return_value=False)
+
+    with pytest.raises(device.AmaranConnectionError, match=message):
+        await light.async_apply_turn_on(intensity=400, brightness_changed=True)
+
+
+@pytest.mark.asyncio
+async def test_primary_confirmation_classifies_no_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unanswered status query is distinct from a state mismatch."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._async_send = AsyncMock()
+
+    result = await light._async_confirm_primary_state_result(
+        lambda: False,
+        attempts=1,
+        timeout=0,
+    )
+
+    assert result is device._PrimaryConfirmation.NO_REPORT
+
+
+@pytest.mark.asyncio
+async def test_primary_confirmation_classifies_mismatching_report(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fresh but wrong status report receives its own diagnostic result."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+
+    async def send(payload: bytes, retries: int = 3) -> None:
+        del retries
+        assert payload == telink.status_request()
+        light._on_access_message(
+            access_message(as_report(telink.cct(4300, 100), on=True))
+        )
+
+    light._async_send = AsyncMock(side_effect=send)
+
+    result = await light._async_confirm_primary_state_result(
+        lambda: False,
+        attempts=1,
+        timeout=0,
+    )
+
+    assert result is device._PrimaryConfirmation.MISMATCHED
 
 
 @pytest.mark.asyncio
