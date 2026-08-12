@@ -11,6 +11,7 @@ MANUFACTURER: Final = "amaran"
 TELINK_ADDRESS_PREFIX: Final = "A4:C1:38"
 
 # Config entry data.
+CONF_APP_PRODUCT_ID: Final = "app_product_id"
 CONF_NET_KEY: Final = "net_key"
 CONF_APP_KEY: Final = "app_key"
 CONF_DEVICE_KEY: Final = "device_key"

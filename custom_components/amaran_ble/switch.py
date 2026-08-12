@@ -62,6 +62,10 @@ class AmaranBoostEntity(SwitchEntity):
     """Enable the Ace 25x high-output Boost mode."""
 
     _attr_has_entity_name = True
+    # Command 70 is write-only. The fixture does not provide a trustworthy
+    # enabled-state report, so this entity reflects the last successful local
+    # request rather than an independently confirmed hardware state.
+    _attr_assumed_state = True
     _attr_translation_key = "boost"
     _attr_icon = "mdi:rocket-launch"
     _attr_should_poll = False

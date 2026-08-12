@@ -64,9 +64,14 @@ async def _async_reprovision_candidates(
     """Return reset fixtures and authenticated interrupted-repair proxies."""
     # Avoid loading the config-flow module just to register lifecycle issue
     # callbacks during normal integration setup.
-    from .config_flow import is_amaran_fixture
+    from .config_flow import _replacement_model_matches_entry, is_amaran_fixture
 
-    return await async_reprovision_candidates(hass, entry, is_amaran_fixture)
+    candidates = await async_reprovision_candidates(hass, entry, is_amaran_fixture)
+    return {
+        address: info
+        for address, info in candidates.items()
+        if _replacement_model_matches_entry(entry, info)
+    }
 
 
 def _preferred_address(

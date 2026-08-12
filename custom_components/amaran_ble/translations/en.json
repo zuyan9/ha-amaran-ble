@@ -11,9 +11,18 @@
       },
       "confirm": {
         "title": "Add {name}",
-        "description": "Home Assistant will provision {name} ({address}) into its own private Bluetooth Mesh network.\n\nThe fixture must already be factory reset. After setup, the amaran app will not see it until you factory reset it again. Verify that the address belongs to the intended amaran fixture before continuing.",
+        "description": "Home Assistant will provision {name} ({address}) into its own private Bluetooth Mesh network.\n\nThe fixture must already be factory reset. After setup, the amaran app will not see it until you factory reset it again. Verify that the address belongs to the intended fixture.\n\n{model_evidence}",
         "data": {
-          "model": "Fixture model",
+          "model": "Fixture model"
+        },
+        "data_description": {
+          "model": "A recognized product ID from the factory-reset provisioning advertisement is preselected when available, but you remain in control of the choice. Check Product model in the fixture's settings in the amaran app. Named profiles apply parameters extracted from the audited Android app catalog. Ace 25x is hardware-tested; every other named profile is experimental. Select Generic only when the model is not listed; its manual capabilities are entered next."
+        }
+      },
+      "generic": {
+        "title": "Configure Generic {name}",
+        "description": "Set the capabilities of {name} ({address}) manually. These fields are used only for Generic fixtures; named models use their pinned app-catalog profile.",
+        "data": {
           "supports_cct": "Fixture has adjustable colour temperature",
           "supports_color": "Fixture supports full colour (HSI)",
           "supports_gm": "Fixture supports green/magenta adjustment",
@@ -21,7 +30,6 @@
           "max_kelvin": "Maximum colour temperature"
         },
         "data_description": {
-          "model": "Choose the exact app model to apply its cataloged light modes, rated color-temperature range, effects, fan, and Boost capabilities. Ace 25x is hardware-tested; every other named profile is experimental. Use Generic only when the model is not listed.",
           "supports_cct": "Turn this off for fixed-daylight fixtures. Models ending in 'x' normally support this; models ending in 'd' normally do not.",
           "supports_color": "Enable this for full-colour fixtures such as models ending in 'c'.",
           "supports_gm": "Adds a separate G/M slider. Enable it only when the fixture supports tint adjustment in CCT mode.",
@@ -80,10 +88,19 @@
   "options": {
     "step": {
       "init": {
-        "title": "Fixture capabilities",
-        "description": "These cannot be read over Bluetooth Mesh, so set them to match your fixture.",
+        "title": "Fixture model",
+        "description": "The app product ID is available only in some factory-reset provisioning advertisements, not normal Mesh reports. Select the exact model shown in the amaran app.\n\n{model_evidence}",
         "data": {
-          "model": "Fixture model",
+          "model": "Fixture model"
+        },
+        "data_description": {
+          "model": "Check Product model in the fixture's settings in the amaran app. Named profiles apply parameters extracted from the audited Android app catalog. Ace 25x is hardware-tested; all other named profiles are experimental. Select Generic only for an unlisted model; its manual capabilities are entered next."
+        }
+      },
+      "generic": {
+        "title": "Generic fixture capabilities",
+        "description": "These fields cannot be read over Bluetooth Mesh and apply only to Generic fixtures. Named models always use their pinned app-catalog profile.",
+        "data": {
           "supports_cct": "Fixture has adjustable colour temperature",
           "supports_color": "Fixture supports full colour (HSI)",
           "supports_gm": "Fixture supports green/magenta adjustment",
@@ -91,7 +108,6 @@
           "max_kelvin": "Maximum colour temperature"
         },
         "data_description": {
-          "model": "Named models use capabilities extracted from the app. Ace 25x is hardware-tested; all other named profiles are experimental. Generic uses the capability fields below.",
           "supports_cct": "Turn this off for fixed-daylight fixtures.",
           "supports_color": "Enable this for full-colour fixtures with HSI control.",
           "supports_gm": "Adds a separate G/M slider and requires adjustable colour temperature.",

@@ -274,6 +274,39 @@ async def test_async_stop_cannot_lose_race_with_inflight_connect(
 
 
 @pytest.mark.asyncio
+async def test_async_stop_restores_locally_started_boost_before_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A graceful reload cannot discard Boost's only output snapshot."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    original = replace(light_state(is_hsi=False, intensity=640), kelvin=4200)
+    light._state = original
+    light._proxy = Mock()
+    light._async_send = AsyncMock()
+    light._async_disconnect = AsyncMock()
+
+    async def confirm(predicate: Any, **_kwargs: Any) -> bool:
+        light._state = original
+        return predicate()
+
+    light._async_confirm_primary_state = AsyncMock(side_effect=confirm)
+
+    await light.async_set_boost(True)
+    await light.async_stop()
+
+    payloads = [call.args[0] for call in light._async_send.await_args_list]
+    assert payloads == [
+        telink.boost(True, 4200, 100),
+        telink.boost(False, 4200, 100),
+        telink.cct(4200, 640),
+        telink.onoff(True),
+    ]
+    assert light._closing
+    assert light._boost_output_snapshot is None
+    light._async_disconnect.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
 async def test_connect_uses_crypto_resolved_alternate_without_changing_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3431,6 +3464,10 @@ async def test_boost_modal_state_and_report_confirmed_fan_write(
             selected_fan = decoded.mode
         elif command == telink.CMD_FAN:
             light._on_access_message(access_message(fan_report(selected_fan)))
+        elif command == telink.CMD_STATUS_REQUEST:
+            light._on_access_message(
+                access_message(as_report(telink.cct(4300, 640), on=True))
+            )
 
     light._async_send = AsyncMock(side_effect=send)
 
@@ -3442,7 +3479,7 @@ async def test_boost_modal_state_and_report_confirmed_fan_write(
     assert light.boost_state.kelvin == 4300
     assert light.fan_state is not None
     assert light.fan_state.mode is telink.FanMode.SILENT
-    assert light._async_refresh_state.await_count == 2
+    light._async_refresh_state.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -3464,11 +3501,466 @@ async def test_boost_tracks_modal_state_without_a_report(
 
 
 @pytest.mark.asyncio
+async def test_explicit_boost_off_restores_exact_cct_brightness_and_power(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Boost dismissal restores the primary CCT look that command 70 replaced."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    original = replace(
+        light_state(is_hsi=False, gm=2, intensity=640),
+        kelvin=4250,
+    )
+    light._state = original
+    light._preferred_gm = 2
+    light._async_send = AsyncMock()
+    light._async_refresh_state = AsyncMock(return_value=True)
+
+    async def confirm(predicate: Any, **_kwargs: Any) -> bool:
+        light._state = original
+        light._effect_state = None
+        light._effect2_state = None
+        light._pixel_state = None
+        return predicate()
+
+    light._async_confirm_primary_state = AsyncMock(side_effect=confirm)
+
+    await light.async_set_boost(True)
+    # A primary report while the modal output is active may describe Boost's
+    # temporary look. It must not replace the saved steady state.
+    light._state = replace(original, intensity=1000, kelvin=5500)
+    await light.async_set_boost(False)
+
+    payloads = [call.args[0] for call in light._async_send.await_args_list]
+    assert payloads == [
+        telink.boost(True, 4250, 100),
+        telink.boost(False, 4250, 100),
+        telink.cct(4250, 640, 2),
+        telink.onoff(True),
+    ]
+    assert light.boost_state == telink.BoostState(False, 4250, 100)
+    assert light._boost_output_snapshot is None
+    assert light.preferred_gm == 2
+    light._async_refresh_state.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_boost_off_restores_a_sleeping_steady_output_without_waking_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A light that was off before Boost returns to off with its saved CCT."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    original = replace(
+        light_state(is_hsi=False, on=False, intensity=310),
+        kelvin=4100,
+    )
+    light._state = original
+    light._async_send = AsyncMock()
+
+    async def confirm(predicate: Any, **_kwargs: Any) -> bool:
+        light._state = original
+        return predicate()
+
+    light._async_confirm_primary_state = AsyncMock(side_effect=confirm)
+
+    await light.async_set_boost(True)
+    await light.async_set_boost(False)
+
+    payloads = [call.args[0] for call in light._async_send.await_args_list]
+    assert payloads[-2:] == [telink.cct(4100, 310), telink.onoff(False)]
+    assert light.state is not None and not light.state.on
+
+
+@pytest.mark.asyncio
+async def test_boost_off_restores_hsi_and_preserves_steady_gm_preference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A modal CCT preview cannot replace the prior HSI look or remembered tint."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    original = light_state(is_hsi=True, intensity=525)
+    light._state = original
+    light._preferred_gm = -3
+    light._async_send = AsyncMock()
+
+    async def confirm(predicate: Any, **_kwargs: Any) -> bool:
+        light._state = original
+        return predicate()
+
+    light._async_confirm_primary_state = AsyncMock(side_effect=confirm)
+
+    await light.async_set_boost(True)
+    light._preferred_gm = 0
+    await light.async_set_boost(False)
+
+    payloads = [call.args[0] for call in light._async_send.await_args_list]
+    assert payloads[-2:] == [telink.hsi(120, 75, 525), telink.onoff(True)]
+    assert light.preferred_gm == -3
+
+
+@pytest.mark.asyncio
+async def test_boost_off_restores_the_exact_active_legacy_effect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closing Boost returns to an effect rather than its stale steady fallback."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._state = replace(light_state(is_hsi=False), kelvin=4200)
+    effect_payload = telink.effect(
+        telink.SystemEffect.TV,
+        intensity=280,
+        frequency=7,
+        variant=2,
+    )
+    original_effect = telink.decode_effect(effect_payload)
+    assert original_effect is not None
+    light._effect_state = original_effect
+    light._async_send = AsyncMock()
+
+    async def confirm(predicate: Any, **_kwargs: Any) -> bool:
+        light._effect_state = original_effect
+        light._effect2_state = None
+        light._pixel_state = None
+        return predicate()
+
+    light._async_confirm_primary_state = AsyncMock(side_effect=confirm)
+
+    await light.async_set_boost(True)
+    light._effect_state = None
+    await light.async_set_boost(False)
+
+    payloads = [call.args[0] for call in light._async_send.await_args_list]
+    assert payloads[-1] == effect_payload
+    assert light.effect_state == original_effect
+
+
+@pytest.mark.asyncio
+async def test_boost_off_restores_a_sleeping_effect_without_waking_the_light(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale steady ON cache cannot wake an effect that was powered down."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    light._state = replace(light_state(is_hsi=False, on=True), kelvin=4200)
+    effect_payload = telink.effect(
+        telink.SystemEffect.TV,
+        intensity=280,
+        frequency=7,
+        variant=2,
+    )
+    active_effect = telink.decode_effect(effect_payload)
+    assert active_effect is not None
+    sleeping_effect = replace(active_effect, on=False)
+    light._effect_state = sleeping_effect
+    light._async_send = AsyncMock()
+
+    async def confirm(predicate: Any, **_kwargs: Any) -> bool:
+        light._effect_state = sleeping_effect
+        light._effect2_state = None
+        light._pixel_state = None
+        return predicate()
+
+    light._async_confirm_primary_state = AsyncMock(side_effect=confirm)
+
+    await light.async_set_boost(True)
+    light._effect_state = None
+    await light.async_set_boost(False)
+
+    payloads = [call.args[0] for call in light._async_send.await_args_list]
+    assert payloads[-2:] == [effect_payload, telink.onoff(False)]
+    assert light.effect_state == sleeping_effect
+    assert light._boost_output_snapshot is None
+
+
+@pytest.mark.asyncio
+async def test_boost_restore_failure_stays_actionable_and_off_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unconfirmed restore keeps the modal session retryable from the switch."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    original = light_state(is_hsi=False)
+    light._state = original
+    light._async_send = AsyncMock()
+    light._async_confirm_primary_state = AsyncMock(side_effect=[False, True])
+
+    await light.async_set_boost(True)
+    with pytest.raises(device.AmaranConnectionError, match="previous light state"):
+        await light.async_set_boost(False)
+
+    assert light.boost_state is not None and light.boost_state.enabled
+    assert light._boost_output_snapshot is not None
+
+    await light.async_set_boost(False)
+
+    assert light.boost_state is not None and not light.boost_state.enabled
+    assert light._boost_output_snapshot is None
+    assert [
+        payload
+        for payload in (call.args[0] for call in light._async_send.await_args_list)
+        if (payload[9] & 0x7F) == telink.CMD_BOOST
+        and not telink.decode_boost(payload).enabled
+    ] == [telink.boost(False, 4300, 100), telink.boost(False, 4300, 100)]
+
+
+@pytest.mark.asyncio
+async def test_boost_snapshot_and_assumed_session_survive_reconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A link loss cannot make an HA-started Boost session impossible to close."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    original = replace(light_state(is_hsi=False), kelvin=4200)
+    light._state = original
+    light._async_send = AsyncMock()
+
+    await light.async_set_boost(True)
+    light._clear_report_state()
+
+    assert light.boost_state is None
+    assert light._boost_output_snapshot is not None
+    light._on_access_message(access_message(as_report(telink.cct(5500, 1000), on=True)))
+    assert light.boost_state is not None and light.boost_state.enabled
+
+    async def confirm(predicate: Any, **_kwargs: Any) -> bool:
+        light._state = original
+        return predicate()
+
+    light._async_confirm_primary_state = AsyncMock(side_effect=confirm)
+    await light.async_set_boost(False)
+
+    payloads = [call.args[0] for call in light._async_send.await_args_list]
+    assert payloads[-4:] == [
+        telink.boost(True, 4200, 100),
+        telink.boost(False, 5500, 100),
+        telink.cct(4200, 640),
+        telink.onoff(True),
+    ]
+    assert light._boost_output_snapshot is None
+
+
+@pytest.mark.asyncio
+async def test_primary_light_change_abandons_boost_snapshot_without_restoring_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new primary request supersedes, rather than briefly restoring, old CCT."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    original = replace(light_state(is_hsi=False), kelvin=4200)
+    requested = replace(original, intensity=700, kelvin=5000)
+    light._state = original
+    light._async_send = AsyncMock()
+
+    await light.async_set_boost(True)
+
+    async def confirm(predicate: Any, **_kwargs: Any) -> bool:
+        light._state = requested
+        return predicate()
+
+    light._async_confirm_primary_state = AsyncMock(side_effect=confirm)
+    await light.async_apply_turn_on(
+        intensity=700,
+        brightness_changed=True,
+        kelvin=5000,
+    )
+
+    payloads = [call.args[0] for call in light._async_send.await_args_list]
+    assert payloads == [
+        telink.boost(True, 4200, 100),
+        telink.boost(False, 4200, 100),
+        telink.cct(5000, 700),
+    ]
+    assert light._boost_output_snapshot is None
+
+
+@pytest.mark.asyncio
+async def test_brightness_while_boost_merges_with_the_pre_boost_colour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partial brightness patch cannot make Boost's temporary CCT durable."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    original = replace(
+        light_state(is_hsi=False, intensity=400),
+        kelvin=2700,
+    )
+    light._state = original
+    light._async_send = AsyncMock()
+
+    await light.async_set_boost(True)
+    light._state = replace(original, intensity=1000, kelvin=5500)
+
+    async def confirm(predicate: Any, **_kwargs: Any) -> bool:
+        light._state = replace(original, intensity=700)
+        return predicate()
+
+    light._async_confirm_primary_state = AsyncMock(side_effect=confirm)
+    await light.async_apply_turn_on(intensity=700, brightness_changed=True)
+
+    payloads = [call.args[0] for call in light._async_send.await_args_list]
+    assert payloads == [
+        telink.boost(True, 2700, 100),
+        telink.boost(False, 2700, 100),
+        telink.cct(2700, 700),
+        telink.onoff(True),
+    ]
+    assert light.state is not None
+    assert light.state.kelvin == 2700
+    assert light.state.intensity == 700
+    assert light._boost_output_snapshot is None
+
+
+@pytest.mark.asyncio
+async def test_colour_only_change_while_boost_keeps_pre_boost_brightness(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CCT patch does not inherit Boost's temporary full intensity."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    original = replace(
+        light_state(is_hsi=False, intensity=400),
+        kelvin=2700,
+    )
+    expected = replace(original, kelvin=4500)
+    light._state = original
+    light._async_send = AsyncMock()
+
+    await light.async_set_boost(True)
+    light._state = replace(original, intensity=1000, kelvin=5500)
+
+    async def confirm(predicate: Any, **_kwargs: Any) -> bool:
+        light._state = expected
+        return predicate()
+
+    light._async_confirm_primary_state = AsyncMock(side_effect=confirm)
+    await light.async_apply_turn_on(
+        intensity=1000,
+        brightness_changed=False,
+        kelvin=4500,
+    )
+
+    payloads = [call.args[0] for call in light._async_send.await_args_list]
+    assert payloads == [
+        telink.boost(True, 2700, 100),
+        telink.boost(False, 2700, 100),
+        telink.cct(4500, 400),
+    ]
+    assert light.state == expected
+    assert light._boost_output_snapshot is None
+
+
+@pytest.mark.asyncio
+async def test_effect_off_while_boost_restores_the_pre_boost_steady_look(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The virtual effect-off action cannot persist command 70's CCT."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    original = replace(
+        light_state(is_hsi=False, intensity=400),
+        kelvin=2700,
+    )
+    light._state = original
+    light._async_send = AsyncMock()
+
+    await light.async_set_boost(True)
+    light._state = replace(original, intensity=1000, kelvin=5500)
+
+    async def confirm(predicate: Any, **_kwargs: Any) -> bool:
+        light._state = original
+        return predicate()
+
+    light._async_confirm_primary_state = AsyncMock(side_effect=confirm)
+    await light.async_apply_effect("off")
+
+    payloads = [call.args[0] for call in light._async_send.await_args_list]
+    assert payloads == [
+        telink.boost(True, 2700, 100),
+        telink.boost(False, 2700, 100),
+        telink.cct(2700, 400),
+        telink.onoff(True),
+    ]
+    assert light.state == original
+    assert light._boost_output_snapshot is None
+
+
+@pytest.mark.asyncio
+async def test_gm_change_while_boost_restores_the_pre_boost_cct_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tint adjustment applies to the old steady CCT, not Boost's CCT."""
+    profile = get_fixture_profile("ace_25c")
+    light = make_light(monkeypatch, profile=profile)
+    original = replace(
+        light_state(is_hsi=False, intensity=400),
+        kelvin=2700,
+    )
+    expected = replace(original, gm=2)
+    light._state = original
+    light._async_send = AsyncMock()
+
+    await light.async_set_boost(True)
+    light._state = replace(original, intensity=1000, kelvin=5000)
+
+    async def confirm(predicate: Any, **_kwargs: Any) -> bool:
+        if light._boost_output_snapshot is not None:
+            light._state = original
+        else:
+            light._state = expected
+        return predicate()
+
+    light._async_confirm_primary_state = AsyncMock(side_effect=confirm)
+    await light.async_set_gm(2)
+
+    payloads = [call.args[0] for call in light._async_send.await_args_list]
+    assert payloads == [
+        telink.boost(True, 4000, 100),
+        telink.boost(False, 4000, 100),
+        telink.cct(2700, 400),
+        telink.onoff(True),
+        telink.cct(2700, 400, 2),
+    ]
+    assert light.state == expected
+    assert light._boost_output_snapshot is None
+
+
+@pytest.mark.asyncio
+async def test_turn_off_while_boost_preserves_the_colour_for_the_next_turn_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OFF keeps the old look instead of retaining command 70's CCT."""
+    light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
+    original = replace(
+        light_state(is_hsi=False, intensity=400),
+        kelvin=2700,
+    )
+    light._state = original
+    light._async_send = AsyncMock()
+    confirmations = 0
+
+    await light.async_set_boost(True)
+    light._state = replace(original, intensity=1000, kelvin=5500)
+
+    async def confirm(predicate: Any, **_kwargs: Any) -> bool:
+        nonlocal confirmations
+        confirmations += 1
+        light._state = replace(original, on=confirmations >= 3)
+        return predicate()
+
+    light._async_confirm_primary_state = AsyncMock(side_effect=confirm)
+    await light.async_apply_turn_off()
+    assert light.state == replace(original, on=False)
+    await light.async_apply_turn_on(intensity=400, brightness_changed=False)
+
+    payloads = [call.args[0] for call in light._async_send.await_args_list]
+    assert payloads == [
+        telink.boost(True, 2700, 100),
+        telink.boost(False, 2700, 100),
+        telink.cct(2700, 400),
+        telink.onoff(False),
+        telink.onoff(False),
+        telink.onoff(True),
+    ]
+    assert light.state == original
+    assert light._boost_output_snapshot is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("enabled", [False, True])
-async def test_boost_same_modal_state_is_idempotent(
+async def test_boost_same_modal_state_reasserts_each_requested_state(
     monkeypatch: pytest.MonkeyPatch, enabled: bool
 ) -> None:
-    """A redundant modal request must not write or refresh the steady output."""
+    """Both writes remain physical actions despite locally assumed state."""
     light = make_light(monkeypatch, profile=ACE_25X_PROFILE)
     steady = light_state(is_hsi=False)
     boost = telink.BoostState(enabled, 4300, 100)
@@ -3479,7 +3971,7 @@ async def test_boost_same_modal_state_is_idempotent(
 
     await light.async_set_boost(enabled)
 
-    light._async_send.assert_not_awaited()
+    light._async_send.assert_awaited_once_with(telink.boost(enabled, 4300, 100))
     light._async_refresh_state.assert_not_awaited()
     assert light.state is steady
     assert light.boost_state is boost
