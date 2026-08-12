@@ -528,6 +528,7 @@ async def test_boost_and_fan_entities_use_device_state() -> None:
     fan = select.AmaranFanModeEntity(entry)
     assert boost.available
     assert boost.is_on
+    assert boost.assumed_state
     assert fan.options == ["silent", "smart"]
     assert fan.current_option == "smart"
     assert fan.entity_category is EntityCategory.CONFIG

@@ -23,6 +23,7 @@ from custom_components.amaran_ble.amaranble.gatt import (
 from custom_components.amaran_ble.amaranble.network import NetworkKeys
 from custom_components.amaran_ble.const import (
     CONF_APP_KEY,
+    CONF_APP_PRODUCT_ID,
     CONF_DEVICE_KEY,
     CONF_NET_KEY,
     CONF_SEQUENCE_STORE_ID,
@@ -87,6 +88,28 @@ async def test_pending_enumeration_preserves_stable_keys_and_skips_bad_records(
 
     assert records == {ADDRESS: stored["fixtures"][ADDRESS]}
     assert records[ADDRESS] is not stored["fixtures"][ADDRESS]
+
+
+@pytest.mark.asyncio
+async def test_reprovision_rejects_a_different_detected_product_before_mutation() -> (
+    None
+):
+    """A reset candidate cannot overwrite the configured fixture's identity."""
+    info = SimpleNamespace(
+        address=ADDRESS,
+        name="SLCK Light",
+        service_data={MESH_PROVISIONING_SERVICE: b"400U5-112233"},
+    )
+
+    with pytest.raises(
+        pending_store.PendingProvisionError, match="does not match the configured"
+    ):
+        await config_flow.async_provision_fixture(
+            object(),
+            info,
+            _force_reprovision=True,
+            _prepared_data={CONF_APP_PRODUCT_ID: "400T5"},
+        )
 
 
 @pytest.mark.asyncio
@@ -493,6 +516,11 @@ async def test_before_data_recovery_runs_a_complete_new_provision(
         "committed": False,
     }
     hass = object()
+    detected_info = SimpleNamespace(
+        address=ADDRESS,
+        name="SLCK Light",
+        service_data={MESH_PROVISIONING_SERVICE: b"400T5-112233"},
+    )
     client = SimpleNamespace(disconnect=AsyncMock())
     provision = AsyncMock()
 
@@ -530,16 +558,18 @@ async def test_before_data_recovery_runs_a_complete_new_provision(
         config_flow, "establish_connection", AsyncMock(return_value=client)
     )
 
-    recovered = await config_flow.async_provision_fixture(hass, INFO)
+    recovered = await config_flow.async_provision_fixture(hass, detected_info)
 
     assert recovered[CONF_NET_KEY] == "aa" * 16
     assert recovered[CONF_APP_KEY] == "bb" * 16
     assert recovered[CONF_DEVICE_KEY] == "33" * 16
     assert recovered[CONF_SEQUENCE_STORE_ID] == "durable-sequence-store"
-    assert save.await_args_list == [
+    assert recovered[CONF_APP_PRODUCT_ID] == "400T5"
+    assert save.await_args_list[-2:] == [
         call(hass, ADDRESS, {"data": recovered, "committed": False}),
         call(hass, ADDRESS, {"data": recovered, "committed": True}),
     ]
+    assert save.await_args_list[0].args[2]["data"][CONF_APP_PRODUCT_ID] == "400T5"
     client.disconnect.assert_awaited_once_with()
 
 

@@ -46,6 +46,31 @@ experimental best-effort profile derived from the official app's bundled
 capability data and reverse-engineered protocol code. Select the exact model;
 use **Generic** only when it is not listed.
 
+### Model catalog provenance
+
+The static model profiles are pinned to `fixtureConfig.json` extracted from the
+official [amaran Android app](https://play.google.com/store/apps/details?id=com.sidus.link.amaran),
+version 1.0.71 (version code 32), whose bundled catalog is revision 30. The
+audited file's SHA-256 is
+`3493e7aa34661bf18efe06d3a07897bdf58b785e8087e658520f62c8d52836a0`.
+This makes model-parameter changes reviewable instead of silently following a
+new mobile-app release. The vendor's live catalog was revision 41 during the
+2026-08-11 audit; its Ace 25x record was unchanged from revision 30. The newer
+catalog was inspected but is not silently substituted for the pinned snapshot.
+
+The [iOS App Store listing](https://apps.apple.com/us/app/amaran/id6503329243)
+reported version 1.0.70 during the 2026-08-11 audit, but its bundled catalog was
+not independently extracted and compared. The integration therefore does not
+claim that the iOS and Android catalog files are identical.
+
+A factory-reset fixture can expose the app product ID in the first 12 ASCII
+bytes of its Mesh Provisioning service data (for example, `400T5-A1B2C3` for
+an Ace 25x). Home Assistant preselects a model only when that ID strictly
+matches the pinned catalog, and still asks the user to confirm or override it.
+Normal post-provisioning Mesh reports do not carry this ID. Named models use the
+pinned catalog profile; only **Generic** opens a second step for manual CCT,
+colour, G/M, and temperature-range settings.
+
 The integration currently exposes capabilities whose packet layout, range, and
 safe defaults are known. It also includes tested low-level codecs for additional
 app protocol families—including RGBW, Gel, XY, generation-III effects,
@@ -70,11 +95,17 @@ The light-control foundation builds on the protocol reverse engineered by
 
 ## Setup
 
-1. Remove the fixture from Sidus Link, then factory-reset its Bluetooth/Mesh
-   settings.
-2. Keep the fixture powered on and close to a connectable Bluetooth adapter.
-3. In Home Assistant, open **Settings → Devices & services → Add integration**.
-4. Select **amaran BLE**, choose the discovered light, and select its model.
+1. Before removing the fixture from the amaran app, record its exact **Product
+   model**. In the audited Android app this is under **Device → fixture → gear
+   → Product model**. The public iOS UI shows the same fixture-settings route,
+   but its settings contents and bundled model catalog have not been
+   independently extracted.
+2. Remove the fixture from the amaran app, then factory-reset its
+   Bluetooth/Mesh settings.
+3. Keep the fixture powered on and close to a connectable Bluetooth adapter.
+4. In Home Assistant, open **Settings → Devices & services → Add integration**.
+5. Select **amaran BLE**, choose the discovered light, and confirm its model.
+   When the strict app product ID is present, Home Assistant preselects it.
 
 For an existing installation, open **Settings → Devices & services → amaran
 BLE → Configure**, select the exact fixture model, and save to reload its

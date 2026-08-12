@@ -49,6 +49,7 @@ from .amaranble.provisioning import Provisioner, ProvisioningError
 from .amaranble.telink import MAX_KELVIN, MIN_KELVIN
 from .const import (
     CONF_APP_KEY,
+    CONF_APP_PRODUCT_ID,
     CONF_DEVICE_KEY,
     CONF_INITIAL_SEQUENCE,
     CONF_IV_INDEX,
@@ -83,7 +84,12 @@ from .pending import (
     async_get_pending_records,
     async_save_pending,
 )
-from .profiles import CATALOG_PROFILES, get_fixture_profile
+from .profiles import (
+    CATALOG_PROFILES,
+    FixtureProfile,
+    get_fixture_profile,
+    get_fixture_profile_by_product_id,
+)
 from .reconfiguration import (
     async_reprovision_candidates,
     async_update_reprovisioned_entry,
@@ -136,6 +142,8 @@ def is_amaran_fixture(info: BluetoothServiceInfoBleak) -> bool:
         or MESH_PROXY_SERVICE in info.service_data
     ):
         return False
+    if _detected_app_product_id(info) is not None:
+        return True
     name = (info.name or "").casefold()
     return info.address.upper().startswith(TELINK_ADDRESS_PREFIX) or any(
         marker in name for marker in ("amaran", "aputure", "sidus", "150c")
@@ -151,15 +159,21 @@ def _kelvin_selector() -> selector.NumberSelector:
     )
 
 
+def _profile_display_name(profile: Any) -> str:
+    """Return one catalog name without repeating its manufacturer."""
+    name = profile.name
+    if profile.manufacturer and not name.casefold().startswith(
+        profile.manufacturer.casefold()
+    ):
+        name = f"{profile.manufacturer} {name}"
+    return name
+
+
 def _model_selector() -> selector.SelectSelector:
     """Offer the app's catalog plus a manually configurable fallback."""
 
     def label(profile: Any) -> str:
-        name = profile.name
-        if profile.manufacturer and not name.casefold().startswith(
-            profile.manufacturer.casefold()
-        ):
-            name = f"{profile.manufacturer} {name}"
+        name = _profile_display_name(profile)
         return f"{name} ({'hardware-tested' if profile.hardware_tested else 'experimental'})"
 
     catalog = sorted(
@@ -183,6 +197,46 @@ def _model_selector() -> selector.SelectSelector:
             ],
             mode=selector.SelectSelectorMode.DROPDOWN,
         )
+    )
+
+
+def _model_schema(values: Mapping[str, Any]) -> vol.Schema:
+    """Show only the model choice; named profiles have no editable overrides."""
+    return vol.Schema(
+        {
+            vol.Required(
+                CONF_MODEL,
+                default=values.get(CONF_MODEL, DEFAULT_PROFILE),
+            ): _model_selector(),
+        }
+    )
+
+
+def _generic_capability_schema(values: Mapping[str, Any]) -> vol.Schema:
+    """Collect manual capabilities only after Generic was selected."""
+    return vol.Schema(
+        {
+            vol.Required(
+                CONF_SUPPORTS_CCT,
+                default=values.get(CONF_SUPPORTS_CCT, DEFAULT_SUPPORTS_CCT),
+            ): selector.BooleanSelector(),
+            vol.Required(
+                CONF_SUPPORTS_COLOR,
+                default=values.get(CONF_SUPPORTS_COLOR, DEFAULT_SUPPORTS_COLOR),
+            ): selector.BooleanSelector(),
+            vol.Required(
+                CONF_SUPPORTS_GM,
+                default=values.get(CONF_SUPPORTS_GM, DEFAULT_SUPPORTS_GM),
+            ): selector.BooleanSelector(),
+            vol.Required(
+                CONF_MIN_KELVIN,
+                default=values.get(CONF_MIN_KELVIN, DEFAULT_MIN_KELVIN),
+            ): _kelvin_selector(),
+            vol.Required(
+                CONF_MAX_KELVIN,
+                default=values.get(CONF_MAX_KELVIN, DEFAULT_MAX_KELVIN),
+            ): _kelvin_selector(),
+        }
     )
 
 
@@ -273,13 +327,155 @@ def suggested_title(info: BluetoothServiceInfoBleak) -> str:
     return f"{name} ({plain_address[-6:]})"
 
 
+def _app_product_id_from_service_data(service_data: bytes | None) -> str | None:
+    """Parse one catalog ID from amaran's strict provisioning-page prefix."""
+    if service_data is None or len(service_data) < 12:
+        return None
+    try:
+        prefix = service_data[:12].decode("ascii")
+    except UnicodeDecodeError:
+        return None
+
+    product_id, separator, fixture_suffix = prefix.partition("-")
+    if (
+        separator != "-"
+        or len(product_id) != 5
+        or any(
+            character not in "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            for character in product_id
+        )
+        or len(fixture_suffix) != 6
+        or any(character not in "0123456789ABCDEF" for character in fixture_suffix)
+    ):
+        return None
+    if get_fixture_profile_by_product_id(product_id).key == PROFILE_GENERIC:
+        return None
+    return product_id
+
+
+def _detected_app_product_id(info: BluetoothServiceInfoBleak) -> str | None:
+    """Return a catalog ID only from a factory-reset provisioning page."""
+    service_data = _service_data(info, MESH_PROVISIONING_SERVICE)
+    product_id = _app_product_id_from_service_data(service_data)
+    if product_id is None or service_data is None:
+        return None
+    address_suffix = str(info.address).replace(":", "").replace("-", "")[-6:].upper()
+    try:
+        advertised_suffix = service_data[6:12].decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    return product_id if advertised_suffix == address_suffix else None
+
+
+def _profile_from_exact_advertised_name(name: str | None) -> FixtureProfile:
+    """Resolve only a literal catalog name or alias, ignoring case and padding."""
+    if not isinstance(name, str) or not (candidate := name.strip().casefold()):
+        return get_fixture_profile(None)
+    for profile in CATALOG_PROFILES:
+        aliases = [
+            profile.key,
+            profile.name,
+            *profile.aliases,
+            *profile.app_product_ids,
+        ]
+        if profile.manufacturer:
+            if profile.name.casefold().startswith(
+                f"{profile.manufacturer.casefold()} "
+            ):
+                aliases.append(profile.name[len(profile.manufacturer) + 1 :])
+            else:
+                aliases.append(f"{profile.manufacturer} {profile.name}")
+        if any(candidate == alias.strip().casefold() for alias in aliases):
+            return profile
+    return get_fixture_profile(None)
+
+
+def _suggested_model(info: BluetoothServiceInfoBleak) -> str:
+    """Prefer a strict product ID, then an exact advertised catalog alias."""
+    if product_id := _detected_app_product_id(info):
+        return get_fixture_profile_by_product_id(product_id).key
+    profile = _profile_from_exact_advertised_name(info.name)
+    return profile.key if profile.key != PROFILE_GENERIC else DEFAULT_PROFILE
+
+
+def _model_evidence(info: BluetoothServiceInfoBleak) -> str:
+    """Explain whether setup has catalog evidence or needs manual selection."""
+    if product_id := _detected_app_product_id(info):
+        profile = get_fixture_profile_by_product_id(product_id)
+        return (
+            f"Detected {_profile_display_name(profile)} "
+            f"(app product ID {product_id}) before provisioning. Confirm or correct it."
+        )
+    if (
+        profile := _profile_from_exact_advertised_name(info.name)
+    ).key != PROFILE_GENERIC:
+        return (
+            f"The advertised name exactly matches {_profile_display_name(profile)}, "
+            "but no app product ID was present. Confirm or correct it."
+        )
+    return (
+        "No recognized app product ID was present. Select the exact model shown "
+        "in the amaran app."
+    )
+
+
+def _stored_model_evidence(data: Mapping[str, Any]) -> str:
+    """Describe immutable discovery evidence stored during initial setup."""
+    product_id = data.get(CONF_APP_PRODUCT_ID)
+    if isinstance(product_id, str):
+        profile = get_fixture_profile_by_product_id(product_id)
+        if profile.key != PROFILE_GENERIC:
+            return (
+                f"Initial setup detected {_profile_display_name(profile)} "
+                f"(app product ID {product_id.upper()})."
+            )
+    return "Initial setup did not record a recognized app product ID."
+
+
+def _store_detected_app_product_id(
+    data: dict[str, Any], product_id: str | None
+) -> None:
+    """Persist discovery evidence without changing a fixture's identity."""
+    if product_id is None:
+        return
+    stored = data.get(CONF_APP_PRODUCT_ID)
+    if stored is not None and stored != product_id:
+        raise PendingProvisionError(
+            "the selected fixture's app product ID does not match the recovery record"
+        )
+    data[CONF_APP_PRODUCT_ID] = product_id
+
+
+def _replacement_model_matches_entry(
+    entry: ConfigEntry, info: BluetoothServiceInfoBleak
+) -> bool:
+    """Reject a recognized replacement whose model contradicts the entry."""
+    product_id = _detected_app_product_id(info)
+    if product_id is None:
+        return True
+
+    stored = entry.data.get(CONF_APP_PRODUCT_ID)
+    if stored is not None:
+        return stored == product_id
+
+    requested_model = entry.options.get(
+        CONF_MODEL, entry.data.get(CONF_MODEL, DEFAULT_PROFILE)
+    )
+    selected = get_fixture_profile(
+        requested_model if isinstance(requested_model, str) else None
+    )
+    if selected.key == PROFILE_GENERIC:
+        return True
+    return get_fixture_profile_by_product_id(product_id).key == selected.key
+
+
 def _service_data(info: BluetoothServiceInfoBleak, service_uuid: str) -> bytes | None:
     """Return one service-data field without relying on UUID key case."""
     wanted = service_uuid.casefold()
     return next(
         (
             bytes(data)
-            for uuid, data in info.service_data.items()
+            for uuid, data in getattr(info, "service_data", {}).items()
             if uuid.casefold() == wanted
         ),
         None,
@@ -448,6 +644,7 @@ async def _async_recover_pending(
     *,
     pending_address: str | None = None,
     require_proxy_identity: bool = False,
+    app_product_id: str | None = None,
 ) -> tuple[dict[str, Any], _PendingAction]:
     """Recover committed keys, or prove old uncommitted keys safe to replace."""
     if record.get("committed") is True and not require_proxy_identity:
@@ -461,6 +658,10 @@ async def _async_recover_pending(
             "pending provisioning credentials have an invalid data record"
         ) from err
     updated = dict(record)
+    before_product_id = pending.get(CONF_APP_PRODUCT_ID)
+    _store_detected_app_product_id(pending, app_product_id)
+    if pending.get(CONF_APP_PRODUCT_ID) != before_product_id:
+        updated["data"] = pending
     if CONF_SEQUENCE_STORE_ID not in pending:
         # Older records predate stable sequence-store IDs. Persist the upgrade
         # before a replacement config entry can consume any mesh sequence.
@@ -541,6 +742,18 @@ async def async_provision_fixture(
 ) -> dict[str, Any]:
     """Provision one fixture or recover a crash-interrupted provisioning."""
     pending_address = _recovery_address or info.address
+    detected_product_id = _detected_app_product_id(info)
+    if _prepared_data is not None:
+        expected_product_id = _prepared_data.get(CONF_APP_PRODUCT_ID)
+        if (
+            detected_product_id is not None
+            and expected_product_id is not None
+            and expected_product_id != detected_product_id
+        ):
+            raise PendingProvisionError(
+                "the selected fixture's app product ID does not match the "
+                "configured fixture"
+            )
     prepared: dict[str, Any] | None = None
     pending_record = await async_get_pending(hass, pending_address)
     if _require_proxy_identity and (
@@ -559,6 +772,7 @@ async def async_provision_fixture(
                     "pending provisioning credentials have an invalid data record"
                 ) from err
             updated = dict(pending_record)
+            _store_detected_app_product_id(prepared, detected_product_id)
             if CONF_SEQUENCE_STORE_ID not in prepared:
                 prepared[CONF_SEQUENCE_STORE_ID] = crypto.random_bytes(16).hex()
             if bearer is _MeshBearer.PROXY:
@@ -622,6 +836,7 @@ async def async_provision_fixture(
                 pending_record,
                 pending_address=pending_address,
                 require_proxy_identity=_require_proxy_identity,
+                app_product_id=detected_product_id,
             )
             if action is _PendingAction.RECOVER:
                 if _recovery_address is not None:
@@ -653,6 +868,7 @@ async def async_provision_fixture(
             )
         if _prepared_data is not None:
             prepared = dict(_prepared_data)
+            _store_detected_app_product_id(prepared, detected_product_id)
             if CONF_SEQUENCE_STORE_ID not in prepared:
                 prepared[CONF_SEQUENCE_STORE_ID] = crypto.random_bytes(16).hex()
             await async_save_pending(
@@ -697,6 +913,15 @@ async def async_provision_fixture(
             CONF_SEQUENCE_STORE_ID: sequence_store_id,
             CONF_NEEDS_CONFIGURATION: True,
         }
+        product_id = detected_product_id
+        if product_id is None and prepared is not None:
+            stored_product_id = prepared.get(CONF_APP_PRODUCT_ID)
+            if isinstance(stored_product_id, str) and (
+                get_fixture_profile_by_product_id(stored_product_id).key
+                != PROFILE_GENERIC
+            ):
+                product_id = stored_product_id.upper()
+        _store_detected_app_product_id(data, product_id)
         await async_save_pending(
             hass,
             pending_address,
@@ -900,8 +1125,49 @@ class AmaranConfigFlow(ConfigFlow, domain=DOMAIN):
         if user_input is None:
             return self._confirm_form(info, {}, {})
 
-        if errors := capability_errors(user_input):
-            return self._confirm_form(info, errors, user_input)
+        requested_model = user_input.get(CONF_MODEL, DEFAULT_PROFILE)
+        profile = get_fixture_profile(
+            requested_model if isinstance(requested_model, str) else None
+        )
+        values = {CONF_MODEL: profile.key}
+        if profile.key == PROFILE_GENERIC:
+            return await self.async_step_generic()
+
+        return await self._async_finish_setup(info, values, generic=False)
+
+    async def async_step_generic(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Collect the manual fields that apply only to Generic fixtures."""
+        assert self._discovery is not None
+        info = self._discovery
+
+        if user_input is None:
+            return self._generic_form(
+                info,
+                {},
+                options_for_profile({CONF_MODEL: PROFILE_GENERIC}),
+            )
+
+        values = {**user_input, CONF_MODEL: PROFILE_GENERIC}
+        if errors := capability_errors(values):
+            return self._generic_form(info, errors, values)
+
+        return await self._async_finish_setup(info, values, generic=True)
+
+    async def _async_finish_setup(
+        self,
+        info: BluetoothServiceInfoBleak,
+        values: dict[str, Any],
+        *,
+        generic: bool,
+    ) -> ConfigFlowResult:
+        """Provision after profile selection and return errors to its own step."""
+
+        def error_form(errors: dict[str, str]) -> ConfigFlowResult:
+            if generic:
+                return self._generic_form(info, errors, values)
+            return self._confirm_form(info, errors, values)
 
         try:
             data = await self._async_provision(info)
@@ -911,20 +1177,22 @@ class AmaranConfigFlow(ConfigFlow, domain=DOMAIN):
                 info.address,
                 err,
             )
-            return self._confirm_form(info, {"base": "provisioning_failed"}, user_input)
+            return error_form({"base": "provisioning_failed"})
         except ProvisioningError as err:
             _LOGGER.error("provisioning %s failed: %s", info.address, err)
-            return self._confirm_form(
-                info, {"base": self._failure_reason(info)}, user_input
-            )
+            return error_form({"base": self._failure_reason(info)})
         except (BleakError, TimeoutError) as err:
             _LOGGER.error("could not reach %s: %s", info.address, err)
-            return self._confirm_form(info, {"base": "cannot_connect"}, user_input)
+            return error_form({"base": "cannot_connect"})
+
+        if product_id := _detected_app_product_id(info):
+            data = dict(data)
+            _store_detected_app_product_id(data, product_id)
 
         return self.async_create_entry(
             title=suggested_title(info),
             data=data,
-            options=options_for_profile(user_input),
+            options=options_for_profile(values),
         )
 
     async def async_step_reconfigure(
@@ -975,9 +1243,14 @@ class AmaranConfigFlow(ConfigFlow, domain=DOMAIN):
         self, entry: ConfigEntry, errors: dict[str, str]
     ) -> ConfigFlowResult:
         """Offer current reset candidates and let an empty form rescan."""
-        self._discovered = await async_reprovision_candidates(
+        candidates = await async_reprovision_candidates(
             self.hass, entry, is_amaran_fixture
         )
+        self._discovered = {
+            address: info
+            for address, info in candidates.items()
+            if _replacement_model_matches_entry(entry, info)
+        }
         if not self._discovered:
             return self.async_show_form(
                 step_id="reconfigure",
@@ -1038,47 +1311,40 @@ class AmaranConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str],
         values: dict[str, Any],
     ) -> ConfigFlowResult:
-        """Ask for the capabilities that cannot be read over the mesh.
+        """Ask for the model that cannot be read over the mesh.
 
-        Fixture capabilities are indistinguishable on the wire: lights accept
-        and echo commands for output modes their LEDs may not actually render.
-        Asking keeps unsupported controls out of Home Assistant.
+        Fixture identities and capabilities are indistinguishable on the wire:
+        lights accept and echo commands for output modes their LEDs may not
+        actually render. Named profiles therefore use the selected app-catalog
+        model without presenting manual fields that would be ignored.
         """
+        form_values = {CONF_MODEL: _suggested_model(info), **values}
         return self.async_show_form(
             step_id="confirm",
             errors=errors,
             description_placeholders={
                 "name": suggested_title(info),
                 "address": info.address,
+                "model_evidence": _model_evidence(info),
             },
-            data_schema=vol.Schema(
-                {
-                    vol.Required(
-                        CONF_MODEL,
-                        default=values.get(CONF_MODEL, DEFAULT_PROFILE),
-                    ): _model_selector(),
-                    vol.Required(
-                        CONF_SUPPORTS_CCT,
-                        default=values.get(CONF_SUPPORTS_CCT, DEFAULT_SUPPORTS_CCT),
-                    ): selector.BooleanSelector(),
-                    vol.Required(
-                        CONF_SUPPORTS_COLOR,
-                        default=values.get(CONF_SUPPORTS_COLOR, DEFAULT_SUPPORTS_COLOR),
-                    ): selector.BooleanSelector(),
-                    vol.Required(
-                        CONF_SUPPORTS_GM,
-                        default=values.get(CONF_SUPPORTS_GM, DEFAULT_SUPPORTS_GM),
-                    ): selector.BooleanSelector(),
-                    vol.Required(
-                        CONF_MIN_KELVIN,
-                        default=values.get(CONF_MIN_KELVIN, DEFAULT_MIN_KELVIN),
-                    ): _kelvin_selector(),
-                    vol.Required(
-                        CONF_MAX_KELVIN,
-                        default=values.get(CONF_MAX_KELVIN, DEFAULT_MAX_KELVIN),
-                    ): _kelvin_selector(),
-                }
-            ),
+            data_schema=_model_schema(form_values),
+        )
+
+    def _generic_form(
+        self,
+        info: BluetoothServiceInfoBleak,
+        errors: dict[str, str],
+        values: Mapping[str, Any],
+    ) -> ConfigFlowResult:
+        """Ask only Generic users for manual capability details."""
+        return self.async_show_form(
+            step_id="generic",
+            errors=errors,
+            description_placeholders={
+                "name": suggested_title(info),
+                "address": info.address,
+            },
+            data_schema=_generic_capability_schema(values),
         )
 
     async def _async_provision(self, info: BluetoothServiceInfoBleak) -> dict[str, Any]:
@@ -1101,47 +1367,63 @@ class AmaranConfigFlow(ConfigFlow, domain=DOMAIN):
 class AmaranOptionsFlow(OptionsFlow):
     """Fixture capabilities that cannot be read over the mesh."""
 
+    def __init__(self) -> None:
+        self._generic_values: dict[str, Any] = {}
+
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         if user_input is not None:
-            if errors := capability_errors(user_input):
-                return self._show_form(user_input, errors)
-            return self.async_create_entry(data=options_for_profile(user_input))
-        return self._show_form(_options_form_values(self.config_entry), {})
+            requested_model = user_input.get(CONF_MODEL, DEFAULT_PROFILE)
+            profile = get_fixture_profile(
+                requested_model if isinstance(requested_model, str) else None
+            )
+            if profile.key != PROFILE_GENERIC:
+                return self.async_create_entry(
+                    data=options_for_profile({CONF_MODEL: profile.key})
+                )
 
-    def _show_form(
+            current = _options_form_values(self.config_entry)
+            self._generic_values = (
+                current
+                if current.get(CONF_MODEL) == PROFILE_GENERIC
+                else options_for_profile({CONF_MODEL: PROFILE_GENERIC})
+            )
+            return await self.async_step_generic()
+        return self._show_model_form(_options_form_values(self.config_entry), {})
+
+    async def async_step_generic(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Edit manual capability fields for the Generic profile."""
+        if user_input is not None:
+            values = {**user_input, CONF_MODEL: PROFILE_GENERIC}
+            if errors := capability_errors(values):
+                return self._show_generic_form(values, errors)
+            return self.async_create_entry(data=options_for_profile(values))
+
+        values = self._generic_values or options_for_profile(
+            {CONF_MODEL: PROFILE_GENERIC}
+        )
+        return self._show_generic_form(values, {})
+
+    def _show_model_form(
         self, values: dict[str, Any], errors: dict[str, str]
     ) -> ConfigFlowResult:
         return self.async_show_form(
             step_id="init",
             errors=errors,
-            data_schema=vol.Schema(
-                {
-                    vol.Required(
-                        CONF_MODEL,
-                        default=values.get(CONF_MODEL, DEFAULT_PROFILE),
-                    ): _model_selector(),
-                    vol.Required(
-                        CONF_SUPPORTS_CCT,
-                        default=values.get(CONF_SUPPORTS_CCT, DEFAULT_SUPPORTS_CCT),
-                    ): selector.BooleanSelector(),
-                    vol.Required(
-                        CONF_SUPPORTS_COLOR,
-                        default=values.get(CONF_SUPPORTS_COLOR, DEFAULT_SUPPORTS_COLOR),
-                    ): selector.BooleanSelector(),
-                    vol.Required(
-                        CONF_SUPPORTS_GM,
-                        default=values.get(CONF_SUPPORTS_GM, DEFAULT_SUPPORTS_GM),
-                    ): selector.BooleanSelector(),
-                    vol.Required(
-                        CONF_MIN_KELVIN,
-                        default=values.get(CONF_MIN_KELVIN, DEFAULT_MIN_KELVIN),
-                    ): _kelvin_selector(),
-                    vol.Required(
-                        CONF_MAX_KELVIN,
-                        default=values.get(CONF_MAX_KELVIN, DEFAULT_MAX_KELVIN),
-                    ): _kelvin_selector(),
-                }
-            ),
+            description_placeholders={
+                "model_evidence": _stored_model_evidence(self.config_entry.data)
+            },
+            data_schema=_model_schema(values),
+        )
+
+    def _show_generic_form(
+        self, values: dict[str, Any], errors: dict[str, str]
+    ) -> ConfigFlowResult:
+        return self.async_show_form(
+            step_id="generic",
+            errors=errors,
+            data_schema=_generic_capability_schema(values),
         )

@@ -117,6 +117,17 @@ class PixelRuntimeState:
         return self.playback is not pixelfx.PixelPlayback.STOP
 
 
+@dataclass(frozen=True, slots=True)
+class _BoostOutputSnapshot:
+    """Primary output that must be restored when a Boost session closes."""
+
+    steady: telink.LightState | None
+    effect: telink.EffectState | None
+    effect2: systemfx2.SystemEffect2State | None
+    pixel: PixelRuntimeState | None
+    preferred_gm: float
+
+
 class _PrimaryConfirmation(Enum):
     """Outcome of waiting for a fresh primary-state report."""
 
@@ -547,6 +558,12 @@ class AmaranLight:
         self._pixel_report_generation = 0
         self._pixel_page_generations: dict[tuple[int, int], int] = {}
         self._boost_state: telink.BoostState | None = None
+        # Command 70 is a write-only modal session. Retain both its locally
+        # assumed state and the pre-session primary output independently of
+        # report pages so a BLE reconnect cannot strand the light at Boost's
+        # CCT or lose the state that an explicit Boost OFF must restore.
+        self._boost_assumed_enabled = False
+        self._boost_output_snapshot: _BoostOutputSnapshot | None = None
         self._fan_state: telink.FanState | None = None
         self._power_state: telink.PowerState | None = None
         self._version_state: telink.VersionState | None = None
@@ -858,7 +875,33 @@ class AmaranLight:
         )
 
     async def async_stop(self) -> None:
-        self._closing = True
+        # Boost is a temporary app-dialog session, not a durable fixture mode.
+        # Close a session that this runtime opened before a graceful reload or
+        # shutdown discards the only copy of its pre-Boost output snapshot.
+        async with self._operation_lock:
+            if self._proxy is not None and (
+                self._boost_assumed_enabled
+                or (self._boost_state is not None and self._boost_state.enabled)
+                or self._boost_output_snapshot is not None
+            ):
+                try:
+                    await self._async_set_boost_unlocked(False)
+                    if self._boost_output_snapshot is not None:
+                        await self._async_restore_boost_output_unlocked(
+                            self._boost_output_snapshot
+                        )
+                except AmaranConnectionError as err:
+                    # Entry unload must still close the BLE client. A later
+                    # explicit OFF always retransmits command 70, even when a
+                    # fresh runtime cannot know that Boost had been active.
+                    _LOGGER.debug(
+                        "could not close Boost while stopping %s: %s",
+                        self.address,
+                        err,
+                    )
+                finally:
+                    self._boost_output_snapshot = None
+            self._closing = True
         tasks = [
             task for task in (self._reconnect_task, self._poll_task) if task is not None
         ]
@@ -1045,6 +1088,7 @@ class AmaranLight:
             raise AmaranConnectionError(
                 f"{self.name} is not running an active generation-II effect"
             )
+        await self._async_abandon_boost_unlocked()
         payloads = self._effect2_payloads(
             state,
             frequency=frequency,
@@ -1128,13 +1172,23 @@ class AmaranLight:
         self._invalidate_steady_requests()
         async with self._operation_lock:
             if selected is telink.SystemEffect.OFF:
+                if self._boost_output_snapshot is not None:
+                    snapshot = self._boost_output_snapshot
+                    await self._async_set_boost_unlocked(False)
+                    await self._async_restore_boost_output_unlocked(
+                        snapshot,
+                        intensity=intensity,
+                        on=True,
+                    )
+                    self._boost_output_snapshot = None
+                    return
+                await self._async_abandon_boost_unlocked()
                 await self._async_exit_effect(intensity=intensity)
                 return
 
+            await self._async_abandon_boost_unlocked()
             current = self._effect_state
             active = self.effect_state
-            if self._boost_state is not None and self._boost_state.enabled:
-                await self._async_set_boost_unlocked(False)
             output_was_on = (
                 active.on
                 if active is not None
@@ -1239,8 +1293,7 @@ class AmaranLight:
         """Select a defaults-proven command-33 pixel program."""
         current = self._pixel_state
         active = self.effect_state
-        if self._boost_state is not None and self._boost_state.enabled:
-            await self._async_set_boost_unlocked(False)
+        await self._async_abandon_boost_unlocked()
         output_was_on = (
             active.on
             if active is not None
@@ -1348,8 +1401,7 @@ class AmaranLight:
         """Select a default-safe command-34 effect with the operation lock held."""
         current = self._effect2_state
         active = self.effect_state
-        if self._boost_state is not None and self._boost_state.enabled:
-            await self._async_set_boost_unlocked(False)
+        await self._async_abandon_boost_unlocked()
         output_was_on = (
             active.on
             if active is not None
@@ -1523,6 +1575,7 @@ class AmaranLight:
             payload = self._effect_payload(state, frequency=target)
             expected = telink.decode_effect(payload)
             assert expected is not None
+            await self._async_abandon_boost_unlocked()
             await self._async_send(payload)
             if not await self._async_confirm_primary_state(
                 lambda: _effect_state_matches(self._effect_state, expected)
@@ -1562,6 +1615,7 @@ class AmaranLight:
             payload = self._effect_payload(state, kelvin=target)
             expected = telink.decode_effect(payload)
             assert expected is not None
+            await self._async_abandon_boost_unlocked()
             await self._async_send(payload)
             if not await self._async_confirm_primary_state(
                 lambda: _effect_state_matches(self._effect_state, expected)
@@ -1591,6 +1645,7 @@ class AmaranLight:
             payload = self._effect_payload(state, hue=target)
             expected = telink.decode_effect(payload)
             assert expected is not None
+            await self._async_abandon_boost_unlocked()
             await self._async_send(payload)
             if not await self._async_confirm_primary_state(
                 lambda: _effect_state_matches(self._effect_state, expected)
@@ -1622,6 +1677,7 @@ class AmaranLight:
             payload = self._effect_payload(state, saturation=target)
             expected = telink.decode_effect(payload)
             assert expected is not None
+            await self._async_abandon_boost_unlocked()
             await self._async_send(payload)
             if not await self._async_confirm_primary_state(
                 lambda: _effect_state_matches(self._effect_state, expected)
@@ -1671,6 +1727,7 @@ class AmaranLight:
             payload = self._effect_payload(state, gm=raw, gm_flag=gm_v2)
             expected = telink.decode_effect(payload)
             assert expected is not None
+            await self._async_abandon_boost_unlocked()
             await self._async_send(payload)
             if not await self._async_confirm_primary_state(
                 lambda: _effect_state_matches(self._effect_state, expected)
@@ -1692,6 +1749,7 @@ class AmaranLight:
             payload = self._effect_payload(state, variant=target)
             expected = telink.decode_effect(payload)
             assert expected is not None
+            await self._async_abandon_boost_unlocked()
             await self._async_send(payload)
             if not await self._async_confirm_primary_state(
                 lambda: _effect_state_matches(self._effect_state, expected)
@@ -1742,6 +1800,7 @@ class AmaranLight:
             payload = self._effect_payload(state, **payload_kwargs)
             expected = telink.decode_effect(payload)
             assert expected is not None
+            await self._async_abandon_boost_unlocked()
             await self._async_send(payload)
             if not await self._async_confirm_primary_state(
                 lambda: _effect_state_matches(self._effect_state, expected)
@@ -1750,15 +1809,221 @@ class AmaranLight:
                     f"{self.name} did not confirm its effect color mode"
                 )
 
+    def _capture_boost_output(self) -> _BoostOutputSnapshot | None:
+        """Capture the primary output before command 70 temporarily replaces it."""
+        if (
+            self._state is None
+            and self._effect_state is None
+            and self._effect2_state is None
+            and self._pixel_state is None
+        ):
+            return None
+        return _BoostOutputSnapshot(
+            steady=self._state,
+            effect=self._effect_state,
+            effect2=self._effect2_state,
+            pixel=self._pixel_state,
+            preferred_gm=self._preferred_gm,
+        )
+
+    async def _async_restore_boost_output_unlocked(
+        self,
+        snapshot: _BoostOutputSnapshot,
+        *,
+        intensity: int | None = None,
+        on: bool | None = None,
+        superseded: asyncio.Event | None = None,
+    ) -> None:
+        """Restore and confirm the exact primary output captured before Boost."""
+
+        async def confirm(predicate: Callable[[], bool]) -> bool:
+            matched = await self._async_confirm_primary_state(
+                predicate,
+                superseded=superseded,
+            )
+            if superseded is not None and superseded.is_set():
+                raise _LightUpdateSuperseded
+            return matched
+
+        if snapshot.effect is not None:
+            target_on = snapshot.effect.on if on is None else on
+            payload = self._effect_payload(snapshot.effect, intensity=intensity)
+            expected = telink.decode_effect(payload)
+            assert expected is not None
+            await self._async_send(payload)
+            if not target_on:
+                # Legacy effect packets always carry sleepMode=active. Restore
+                # the selected program first, then put it back to sleep so an
+                # OFF fixture cannot flash or wake permanently after Boost.
+                await self.async_turn_off()
+                expected = replace(expected, on=False)
+            if not await confirm(
+                lambda: _effect_state_matches(self._effect_state, expected)
+            ):
+                raise AmaranConnectionError(
+                    f"{self.name} left Boost but did not confirm its previous effect"
+                )
+            self._preferred_gm = snapshot.preferred_gm
+            return
+
+        if snapshot.effect2 is not None:
+            payloads = self._effect2_payloads(
+                snapshot.effect2,
+                on=snapshot.effect2.on if on is None else on,
+                intensity=intensity,
+            )
+            expected2 = self._decode_effect2_sequence(payloads)
+            for payload in payloads:
+                await self._async_send(payload)
+            if not await confirm(
+                lambda: _effect2_state_matches(self._effect2_state, expected2)
+            ):
+                raise AmaranConnectionError(
+                    f"{self.name} left Boost but did not confirm its previous effect"
+                )
+            self._preferred_gm = snapshot.preferred_gm
+            return
+
+        if snapshot.pixel is not None:
+            # A lone CONTINUE report cannot prove the prior power bit. Match
+            # the app's existing interpretation and preserve it as running;
+            # an explicit STOP, however, must remain stopped.
+            expected_on = snapshot.pixel.on is not False if on is None else on
+            payloads = _pixel_payloads(
+                snapshot.pixel,
+                intensity=intensity,
+                on=expected_on,
+            )
+            expected_pixel = _decode_pixel_sequence(payloads)
+            report_generation = self._pixel_report_generation
+            for payload in payloads:
+                await self._async_send(payload)
+
+            def pixel_matches() -> bool:
+                report = self._pixel_state
+                return (
+                    report is not None
+                    and report.effect is expected_pixel.effect
+                    and report.on is expected_on
+                    and self._pixel_page_generations.get((2, 0), 0) > report_generation
+                    and (
+                        report.intensity is None
+                        or expected_pixel.intensity is None
+                        or intensities_have_same_brightness(
+                            report.intensity, expected_pixel.intensity
+                        )
+                    )
+                )
+
+            if not await confirm(pixel_matches):
+                raise AmaranConnectionError(
+                    f"{self.name} left Boost but did not confirm its previous effect"
+                )
+            self._preferred_gm = snapshot.preferred_gm
+            return
+
+        steady = snapshot.steady
+        if steady is None:
+            return
+        target_intensity = steady.intensity if intensity is None else intensity
+        target_on = steady.on if on is None else on
+        if steady.is_hsi:
+            await self.async_set_hsi(
+                steady.hue,
+                steady.saturation,
+                target_intensity,
+            )
+        else:
+            await self.async_set_cct(
+                steady.kelvin,
+                target_intensity,
+                steady.gm,
+            )
+        # Parameter writes do not reliably wake or sleep an Ace. Restore the
+        # captured power bit explicitly after restoring colour and intensity.
+        await (self.async_turn_on() if target_on else self.async_turn_off())
+
+        def steady_matches() -> bool:
+            report = self._state
+            if (
+                report is None
+                or self._effect_state is not None
+                or self._effect2_state is not None
+                or self._pixel_state is not None
+                or report.on is not target_on
+                or not intensities_have_same_brightness(
+                    report.intensity, target_intensity
+                )
+                or report.is_hsi is not steady.is_hsi
+            ):
+                return False
+            if steady.is_hsi:
+                return (
+                    report.hue == steady.hue and report.saturation == steady.saturation
+                )
+            return report.kelvin == steady.kelvin and report.gm == steady.gm
+
+        if not await confirm(steady_matches):
+            raise AmaranConnectionError(
+                f"{self.name} left Boost but did not confirm its previous light state"
+            )
+        self._preferred_gm = snapshot.preferred_gm
+
+    async def _async_abandon_boost_unlocked(self) -> None:
+        """Close Boost because another primary-light request supersedes it."""
+        boost_active = self._boost_assumed_enabled or (
+            self._boost_state is not None and self._boost_state.enabled
+        )
+        if not boost_active:
+            return
+        await self._async_set_boost_unlocked(False)
+        self._boost_output_snapshot = None
+
     async def async_set_boost(self, enabled: bool) -> None:
-        """Enter or leave the Ace Boost modal session after a Mesh write."""
+        """Enter Boost, or explicitly leave it and restore the prior output."""
         if not self.profile.supports_boost:
             raise AmaranConnectionError(f"Boost is not enabled for {self.name}")
         async with self._operation_lock:
-            if self._boost_state is not None and self._boost_state.enabled is enabled:
+            boost_active = self._boost_assumed_enabled or (
+                self._boost_state is not None and self._boost_state.enabled
+            )
+            if enabled:
+                # Command 70 has no trustworthy acknowledgement. Match the
+                # app's slider behavior by allowing ON to be reasserted, while
+                # capturing the primary output only for the first successful
+                # entry into this modal session.
+                snapshot = None if boost_active else self._capture_boost_output()
+                await self._async_set_boost_unlocked(True)
+                if not boost_active:
+                    self._boost_output_snapshot = snapshot
                 return
-            await self._async_set_boost_unlocked(enabled)
-            await self._async_refresh_state()
+            if not boost_active and self._boost_output_snapshot is None:
+                # Enabled state is locally assumed and disappears on a process
+                # crash. Keep OFF idempotent on the fixture, not only in this
+                # cache, so an explicit service call can end an inherited
+                # write-only Boost session after a fresh HA runtime starts.
+                await self._async_set_boost_unlocked(False)
+                return
+
+            previous_boost = self._boost_state
+            await self._async_set_boost_unlocked(False)
+            snapshot = self._boost_output_snapshot
+            if snapshot is None:
+                return
+            try:
+                await self._async_restore_boost_output_unlocked(snapshot)
+            except BaseException:
+                # Treat an unconfirmed restore as an unfinished Boost session
+                # so the switch remains actionable and OFF can retry it.
+                self._boost_assumed_enabled = True
+                retry_source = previous_boost or self._boost_state
+                if retry_source is not None:
+                    retry_state = replace(retry_source, enabled=True)
+                    if retry_state != self._boost_state:
+                        self._boost_state = retry_state
+                        self._notify_listeners()
+                raise
+            self._boost_output_snapshot = None
 
     async def _async_set_boost_unlocked(
         self,
@@ -1786,6 +2051,7 @@ class AmaranLight:
         # write succeeds while still accepting any asynchronous parameter report.
         self._boost_received.clear()
         await self._async_send(telink.boost(enabled, kelvin, gm))
+        self._boost_assumed_enabled = enabled
         reported = self._boost_state if self._boost_received.is_set() else None
         updated = telink.BoostState(
             enabled,
@@ -2011,15 +2277,47 @@ class AmaranLight:
                 else self._last_primary_confirmation
             )
 
-        state = self._state
-        effect_state = self.effect_state
         expected_gm = self._preferred_gm
-        boost_active = self._boost_state is not None and self._boost_state.enabled
-        if boost_active and (
+        boost_active = self._boost_assumed_enabled or (
+            self._boost_state is not None and self._boost_state.enabled
+        )
+        boost_snapshot = self._boost_output_snapshot
+        if boost_snapshot is not None:
+            expected_gm = boost_snapshot.preferred_gm
+        boost_session = boost_active or boost_snapshot is not None
+        restore_snapshot_on_success = False
+        if boost_session and (
             brightness_changed or hs_color is not None or kelvin is not None
         ):
             await self._async_set_boost_unlocked(False)
             ensure_current()
+            if boost_snapshot is not None and hs_color is None and kelvin is None:
+                # Brightness is a partial HA light patch. Merge it into the
+                # pre-Boost mode instead of applying it to Boost's temporary
+                # CCT/effect report and accidentally making that look durable.
+                await self._async_restore_boost_output_unlocked(
+                    boost_snapshot,
+                    intensity=intensity,
+                    on=True,
+                    superseded=superseded,
+                )
+                self._boost_output_snapshot = None
+                return
+            if boost_snapshot is not None and not brightness_changed:
+                # A colour-only request should retain the brightness that was
+                # active before Boost, not a temporary command-70 report.
+                snapshot_state = (
+                    boost_snapshot.effect
+                    or boost_snapshot.effect2
+                    or boost_snapshot.pixel
+                    or boost_snapshot.steady
+                )
+                snapshot_intensity = getattr(snapshot_state, "intensity", None)
+                if isinstance(snapshot_intensity, int) and snapshot_intensity > 0:
+                    intensity = snapshot_intensity
+            restore_snapshot_on_success = boost_snapshot is not None
+        state = self._state
+        effect_state = self.effect_state
         if self._effect2_state is not None and hs_color is None and kelvin is None:
             await self._async_apply_effect2_unlocked(
                 self._effect2_state.effect,
@@ -2131,6 +2429,8 @@ class AmaranLight:
 
         result = await confirm(steady_state_matches)
         if result is _PrimaryConfirmation.MATCHED:
+            if restore_snapshot_on_success:
+                self._boost_output_snapshot = None
             return
         if result is _PrimaryConfirmation.NO_REPORT:
             raise AmaranConnectionError(
@@ -2145,15 +2445,36 @@ class AmaranLight:
         self._invalidate_steady_requests()
         async with self._operation_lock:
             boost_error: AmaranConnectionError | None = None
+            boost_restore_error: AmaranConnectionError | None = None
             pixel_error: AmaranConnectionError | None = None
             pixel_report_generation = self._pixel_report_generation
-            if self._boost_state is not None and self._boost_state.enabled:
+            boost_snapshot = self._boost_output_snapshot
+            boost_session = (
+                self._boost_assumed_enabled
+                or (self._boost_state is not None and self._boost_state.enabled)
+                or boost_snapshot is not None
+            )
+            if boost_session:
                 try:
                     await self._async_set_boost_unlocked(False)
                 except AmaranConnectionError as err:
                     # Safety beats perfect mode bookkeeping: an unavailable
                     # Boost exit write must never prevent the user's OFF.
                     boost_error = err
+                else:
+                    if boost_snapshot is not None:
+                        try:
+                            # OFF is also a partial HA light action: preserve
+                            # the pre-Boost colour/effect while forcing its
+                            # power bit off, so the next ON uses that old look.
+                            await self._async_restore_boost_output_unlocked(
+                                boost_snapshot,
+                                on=False,
+                            )
+                        except AmaranConnectionError as err:
+                            boost_restore_error = err
+                        else:
+                            self._boost_output_snapshot = None
             if self._pixel_state is not None and self._pixel_state.on:
                 try:
                     # Pixel models use their STOP playback state when the app
@@ -2196,6 +2517,11 @@ class AmaranLight:
                 raise AmaranConnectionError(
                     f"{self.name} was turned off, but leaving Boost could not be sent"
                 ) from boost_error
+            if boost_restore_error is not None:
+                raise AmaranConnectionError(
+                    f"{self.name} was turned off, but its pre-Boost light state "
+                    "could not be restored"
+                ) from boost_restore_error
             if pixel_error is not None:
                 raise AmaranConnectionError(
                     f"{self.name} was turned off, but stopping its pixel effect "
@@ -2214,6 +2540,14 @@ class AmaranLight:
         )
         async with self._operation_lock:
             previous = self._preferred_gm
+            boost_snapshot = self._boost_output_snapshot
+            if boost_snapshot is not None:
+                await self._async_set_boost_unlocked(False)
+                await self._async_restore_boost_output_unlocked(
+                    boost_snapshot,
+                    on=True,
+                )
+                self._boost_output_snapshot = None
             state = self._state
             if state is None:
                 raise AmaranConnectionError(f"{self.name} has not reported its state")
@@ -2224,6 +2558,8 @@ class AmaranLight:
                 return
 
             try:
+                if boost_snapshot is None:
+                    await self._async_abandon_boost_unlocked()
                 await self.async_set_cct(state.kelvin, state.intensity, target)
                 self._preferred_gm = target
                 if not await self._async_confirm_primary_state(
@@ -2873,7 +3209,9 @@ class AmaranLight:
                 minimum = self.profile.boost_min_kelvin or self.profile.min_kelvin
                 maximum = self.profile.boost_max_kelvin or self.profile.max_kelvin
                 self._boost_state = telink.BoostState(
-                    False, min(max(boost_kelvin, minimum), maximum), 100
+                    self._boost_assumed_enabled,
+                    min(max(boost_kelvin, minimum), maximum),
+                    100,
                 )
             changed = (
                 report != self._state
@@ -2899,7 +3237,7 @@ class AmaranLight:
                 minimum = self.profile.boost_min_kelvin or self.profile.min_kelvin
                 maximum = self.profile.boost_max_kelvin or self.profile.max_kelvin
                 self._boost_state = telink.BoostState(
-                    False,
+                    self._boost_assumed_enabled,
                     min(max(self._default_effect_kelvin(), minimum), maximum),
                     100,
                 )
@@ -2924,7 +3262,7 @@ class AmaranLight:
                 minimum = self.profile.boost_min_kelvin or self.profile.min_kelvin
                 maximum = self.profile.boost_max_kelvin or self.profile.max_kelvin
                 self._boost_state = telink.BoostState(
-                    False,
+                    self._boost_assumed_enabled,
                     min(max(self._default_effect_kelvin(), minimum), maximum),
                     100,
                 )
@@ -2969,7 +3307,11 @@ class AmaranLight:
             # The APK ignores this report's modal bit. Preserve the locally
             # commanded session state; an unsolicited report can update only
             # parameters and can never turn Boost on by itself.
-            enabled = self._boost_state.enabled if self._boost_state else False
+            enabled = (
+                self._boost_state.enabled
+                if self._boost_state is not None
+                else self._boost_assumed_enabled
+            )
             report = replace(report, enabled=enabled)
             changed = report != self._boost_state
             self._boost_state = report
